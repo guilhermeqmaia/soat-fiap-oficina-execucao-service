@@ -8,22 +8,22 @@
 
 ## Responsabilidades
 
-**Possui:** fila de execução das OS, diagnóstico (itens com preço congelado), **Catálogo** de serviços/produtos e **Estoque** (reservas e baixas com *conditional writes*). Banco próprio **DynamoDB** single-table `oficina-execucao` ([RFC-0007](https://github.com/guilhermeqmaia/soat-fiap-oficina-mecanica-app/blob/main/docs/arquitetura/rfcs/RFC-0007-banco-nosql.md)).
+**Possui:** fila de execução das OS, diagnóstico (itens com preço congelado), **Catálogo** de serviços/produtos e **Estoque** (reservas e baixas com _conditional writes_). Banco próprio **DynamoDB** single-table `oficina-execucao` ([RFC-0007](https://github.com/guilhermeqmaia/soat-fiap-oficina-mecanica-app/blob/main/docs/arquitetura/rfcs/RFC-0007-banco-nosql.md)).
 
 **Não possui:** a OS e seu ciclo de vida (OS Service), orçamento/pagamento (Billing).
 
 ## Eventos e comandos
 
-| Direção | Mensagem |
-|---|---|
-| consome (fila `execucao-comandos`) | `execucao.enfileirar`, `execucao.iniciar`, `execucao.liberar-reservas` |
+| Direção                             | Mensagem                                                                                                                                                 |
+| ----------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| consome (fila `execucao-comandos`)  | `execucao.enfileirar`, `execucao.iniciar`, `execucao.liberar-reservas`                                                                                   |
 | publica (tópico `oficina-execucao`) | `execucao.enfileirada`, `execucao.recusada`, `execucao.diagnostico-concluido`, `execucao.iniciada`, `execucao.finalizada`, `execucao.reservas-liberadas` |
 
 Contratos: [`docs/contratos/asyncapi.yaml`](https://github.com/guilhermeqmaia/soat-fiap-oficina-mecanica-app/blob/main/docs/contratos/asyncapi.yaml).
 
 ## Histórias
 
-- [US-F4-04 — Repositórios dos serviços com CI/CD independente](https://github.com/guilhermeqmaia/soat-fiap-oficina-mecanica-app/blob/main/docs/user-stories/f4-04-repos-e-cicd-por-servico.md) *(este scaffold)*
+- [US-F4-04 — Repositórios dos serviços com CI/CD independente](https://github.com/guilhermeqmaia/soat-fiap-oficina-mecanica-app/blob/main/docs/user-stories/f4-04-repos-e-cicd-por-servico.md) _(este scaffold)_
 - [US-F4-07 — Fila de execução, diagnóstico, catálogo e estoque em DynamoDB](https://github.com/guilhermeqmaia/soat-fiap-oficina-mecanica-app/blob/main/docs/user-stories/f4-07-execucao-service.md)
 - [US-F4-11 — Compensações (liberar reservas)](https://github.com/guilhermeqmaia/soat-fiap-oficina-mecanica-app/blob/main/docs/user-stories/f4-11-compensacoes-rollback.md)
 
