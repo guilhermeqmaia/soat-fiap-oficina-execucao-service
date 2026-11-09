@@ -1,6 +1,6 @@
 import { ConfigService } from '@nestjs/config';
 import { ClienteHttpInterno } from '@guilhermeqmaia/oficina-kit/http';
-import { OsServiceClient } from './os-service.client';
+import { BACKOFF_CONFLITO_MS, OsServiceClient } from './os-service.client';
 import { OsServiceIndisponivelFilter } from './os-service-indisponivel.filter';
 import { OsServiceIndisponivelError } from '../../application/ports/os-service.gateway';
 import { OsServiceRecusouError } from '../../domain/errors/os-service-recusou.error';
@@ -13,8 +13,16 @@ const http = new ClienteHttpInterno({
   tentativas: 2,
   backoffMs: [1],
 });
+/** Nao espera o backoff real dos 409; registra as esperas pedidas. */
+class OsServiceClientSemEspera extends OsServiceClient {
+  readonly esperas: number[] = [];
+  protected override aguardar(ms: number): Promise<void> {
+    this.esperas.push(ms);
+    return Promise.resolve();
+  }
+}
 const cliente = (url = `${os.url}/`) =>
-  new OsServiceClient(http, new ConfigService({ OS_SERVICE_URL: url }));
+  new OsServiceClientSemEspera(http, new ConfigService({ OS_SERVICE_URL: url }));
 const diagnostico = {
   numeroOS: 'OS 1',
   mecanicoId: 'mec-1',
@@ -61,16 +69,36 @@ describe('OsServiceClient (callbacks RFC-0008)', () => {
     });
   });
 
-  it('4xx vira OsServiceRecusouError sem retry (usa `motivo` ou `message`)', async () => {
-    os.responder({ status: 409, body: { motivo: 'OS cancelada' } });
+  it('400/404 viram OsServiceRecusouError sem retry (usa `motivo` ou `message`)', async () => {
+    os.responder({ status: 404, body: { motivo: 'OS nao encontrada' } });
     await expect(cliente().diagnosticoConcluido(diagnostico)).rejects.toEqual(
-      new OsServiceRecusouError(409, 'OS cancelada'),
+      new OsServiceRecusouError(404, 'OS nao encontrada'),
     );
     expect(os.recebidas).toHaveLength(1);
     os.responder({ status: 404, body: { message: ['nao achei'] } });
     await expect(cliente().diagnosticoConcluido(diagnostico)).rejects.toThrow('nao achei');
     os.responder({ status: 400 });
     await expect(cliente().diagnosticoConcluido(diagnostico)).rejects.toThrow('sem detalhes');
+  });
+
+  it('409 e transitorio: repete o MESMO envelope com backoff e passa quando o OS aceita', async () => {
+    os.responder({ status: 409, body: { motivo: 'repita o callback' } }, { status: 200 });
+    const c = cliente();
+    await expect(c.diagnosticoConcluido(diagnostico)).resolves.toBeUndefined();
+    expect(os.recebidas).toHaveLength(2);
+    expect(os.recebidas[1].body).toEqual(os.recebidas[0].body);
+    expect(c.esperas).toEqual([BACKOFF_CONFLITO_MS[0]]);
+  });
+
+  it('409 persistente (4x) vira OsServiceIndisponivelError (502, compensacao local)', async () => {
+    os.responder({ status: 409 }, { status: 409 }, { status: 409 }, { status: 409 });
+    const c = cliente();
+    const erro = await c.diagnosticoConcluido(diagnostico).catch((e: unknown) => e);
+    expect(erro).toBeInstanceOf(OsServiceIndisponivelError);
+    expect((erro as Error).message).toMatch(/409.*4 vezes/);
+    expect(os.recebidas).toHaveLength(4);
+    expect(new Set(os.recebidas.map((r) => (r.body as { id: string }).id)).size).toBe(1);
+    expect(c.esperas).toEqual([...BACKOFF_CONFLITO_MS]);
   });
 
   it('5xx: retry e depois OsServiceIndisponivelError; 5xx seguido de sucesso passa', async () => {
@@ -81,6 +109,15 @@ describe('OsServiceClient (callbacks RFC-0008)', () => {
     expect(os.recebidas).toHaveLength(2);
     os.responder({ status: 500 }, { status: 200 });
     await expect(cliente().diagnosticoConcluido(diagnostico)).resolves.toBeUndefined();
+  });
+
+  it('aguardar() real espera via setTimeout', async () => {
+    jest.useFakeTimers();
+    const real = new OsServiceClient(http, new ConfigService({ OS_SERVICE_URL: os.url }));
+    const espera = (real as unknown as { aguardar(ms: number): Promise<void> }).aguardar(200);
+    await jest.advanceTimersByTimeAsync(200);
+    await expect(espera).resolves.toBeUndefined();
+    jest.useRealTimers();
   });
 
   it('sem OS_SERVICE_URL o callback e ignorado (dev)', async () => {

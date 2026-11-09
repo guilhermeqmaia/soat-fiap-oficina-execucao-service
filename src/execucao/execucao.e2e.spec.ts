@@ -271,7 +271,7 @@ describe('Execucao (e2e: DynamoDB Local + mock do OS Service)', () => {
     expect(recusa.body.motivo).toContain('CANCELADA');
   });
 
-  it('OS Service fora do ar: 502 e a baixa e devolvida; recusa do OS = 409', async () => {
+  it('OS Service fora do ar: 502 e a baixa e devolvida; recusa do OS (404) = 409; 409 do OS repete', async () => {
     const c = await diagnostico('OS-400', 1, 1);
     os.responder({ status: 503 });
     await api()
@@ -280,14 +280,25 @@ describe('Execucao (e2e: DynamoDB Local + mock do OS Service)', () => {
       .send({ diagnostico: 'x' })
       .expect(502);
     expect(await saldo(c.p1)).toBe(5);
-    os.responder({ status: 409, body: { motivo: 'OS cancelada' } });
+    os.responder({ status: 404, body: { motivo: 'OS nao encontrada' } });
     const res = await api()
       .post('/execucao/ordens/OS-400/diagnostico')
       .set('Authorization', mecanico)
       .send({ diagnostico: 'x' })
       .expect(409);
-    expect(res.body.motivo).toContain('OS cancelada');
+    expect(res.body.motivo).toContain('OS nao encontrada');
     expect(await saldo(c.p1)).toBe(5);
+    // 409 do OS = "repita o callback": o mesmo envelope e reenviado e a baixa fica
+    os.limpar();
+    os.responder({ status: 409, body: { motivo: 'saga alterada, repita' } }, { status: 200 });
+    await api()
+      .post('/execucao/ordens/OS-400/diagnostico')
+      .set('Authorization', mecanico)
+      .send({ diagnostico: 'x' })
+      .expect(200);
+    expect(os.recebidas).toHaveLength(2);
+    expect(os.recebidas[1].body).toEqual(os.recebidas[0].body);
+    expect(await saldo(c.p1)).toBe(3);
   });
 
   it('CRUD de produtos com entrada de estoque auditada; SKU duplicado = 409', async () => {

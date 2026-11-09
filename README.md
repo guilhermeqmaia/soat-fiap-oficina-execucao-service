@@ -102,7 +102,7 @@ sequenceDiagram
 ```
 
 - A **baixa** acontece no fechamento do diagnóstico; a **devolução**, no `DELETE` do OS Service. `iniciar` só muda o status (as peças já foram baixadas).
-- **Consistência:** cada operação grava primeiro o estado local (o lock otimista serializa operações concorrentes e impede baixa em dobro) e só então propaga. Se o callback falhar, o estado local é **restaurado** e as peças baixadas são **devolvidas**. Resposta: `409 { motivo }` se o OS recusou (4xx), `502` se ficou indisponível (timeout/rede/5xx após os retries).
+- **Consistência:** cada operação grava primeiro o estado local (o lock otimista serializa operações concorrentes e impede baixa em dobro) e só então propaga. Se o callback falhar, o estado local é **restaurado** e as peças baixadas são **devolvidas**. Resposta: `409 { motivo }` se o OS recusou (`400`/`404`/demais 4xx), `502` se ficou indisponível (timeout/rede/5xx após os retries). Exceção: um `409` do OS **não** é recusa, e sim "a OS/saga mudou ao mesmo tempo, repita o callback" — o callback é repetido com o **mesmo envelope** (o OS deduplica pelo `id`) até 3 vezes com backoff (200 ms, 800 ms, 3 s); só se persistir vira `502` e a compensação roda.
 - **Recusa de negócio** = `409 { statusCode, message, motivo }` em todas as rotas de `/execucao/ordens` (o OS lê `motivo` para montar `execucao.recusada`).
 - **Idempotência:** `POST /execucao/ordens` por `numeroOS` (repetir devolve a mesma execução), `iniciar` repetido = `200`, `DELETE` repetido ou sem execução = `200` sem efeito (a devolução é o líquido do histórico).
 
@@ -117,7 +117,7 @@ sequenceDiagram
 
 - `POST {OS_SERVICE_URL}/ordens-servico/{numeroOS}/eventos` com o envelope `{ id (UUID v7), type, version: 1, occurredAt, producer: "execucao-service", data }` (`criarEnvelopeHttp`).
 - Auth: JWT de serviço (`role: SERVICO`, `sub: execucao-service`, mesmo `JWT_SECRET`). Header `x-correlation-id` = número da OS.
-- Retry com backoff (200 ms, 800 ms, 3 s) só para timeout/rede/5xx; 4xx não repete. `OS_SERVICE_TENTATIVAS` ajusta o número de tentativas.
+- Retry do kit com backoff (200 ms, 800 ms, 3 s) só para timeout/rede/5xx; `OS_SERVICE_TENTATIVAS` ajusta o número de tentativas. Por cima disso, o `OsServiceClient` repete um `409` do OS (conflito transitório) com o mesmo envelope, até 3 vezes (`BACKOFF_CONFLITO_MS`); `400`/`404` não repetem.
 
 ## Rotas e roles
 
@@ -232,7 +232,7 @@ npm run test:unit:cov      # domínio + casos de uso + OsServiceClient (gate 80%
 npm run test:integration   # e2e: AppModule real + DynamoDB Local + OS Service fake (recebe os callbacks)
 ```
 
-- **Unitários:** máquina de estados, agregado `Execucao`, validação de saldo, planejamento de baixa/devolução (idempotência), casos de uso com fakes (compensações quando o callback falha, idempotência, fila), `OsServiceClient` contra um servidor HTTP fake (envelope, JWT, correlação, retry, 4xx/5xx), filtro `409 { motivo }`.
+- **Unitários:** máquina de estados, agregado `Execucao`, validação de saldo, planejamento de baixa/devolução (idempotência), casos de uso com fakes (compensações quando o callback falha, idempotência, fila), `OsServiceClient` contra um servidor HTTP fake (envelope, JWT, correlação, retry em 5xx e em 409, 400/404), filtro `409 { motivo }`.
 - **e2e** (`*.e2e.spec.ts`): sobe `amazon/dynamodb-local` via testcontainers (ou usa `DYNAMODB_ENDPOINT` se definido, ex. `docker compose up -d dynamodb`), cria as tabelas com prefixo próprio e cobre: fluxo completo do contrato (enfileirar → diagnóstico → iniciar → finalizar, com os callbacks verificados), veículo duplicado, estoque insuficiente (nada baixado), `DELETE` idempotente, OS Service fora do ar (502 + devolução), roles por rota, CRUDs.
 
 ## Deploy
