@@ -1,6 +1,6 @@
 # oficina-execucao-service
 
-[![CI](https://github.com/engineercodeprojects/fase-04-soat-fiap-oficina-execucao-service/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/engineercodeprojects/fase-04-soat-fiap-oficina-execucao-service/actions/workflows/ci.yml)
+[![CI](https://github.com/guilhermeqmaia/soat-fiap-oficina-execucao-service/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/guilhermeqmaia/soat-fiap-oficina-execucao-service/actions/workflows/ci.yml)
 
 Microsserviço **Execução** da Oficina Mecânica (Tech Challenge FIAP, Fase 4). Cuida da **execução das Ordens de Serviço (OS)**: atribuição de mecânico, diagnóstico (serviços + peças), catálogo de serviços e produtos, **estoque com baixa e devolução (rollback) transacionais** e o ciclo de vida da execução. A OS em si (dados e status oficial) pertence ao **OS Service** (`fase-04-soat-fiap-oficina-os-service`), acessado por HTTP.
 
@@ -72,7 +72,7 @@ NA_FILA ──► ATRIBUIDA ──► EM_DIAGNOSTICO ──► AGUARDANDO_APROVA
 
 ## Fluxo ponta a ponta (contrato RFC-0008)
 
-O OS Service é o orquestrador da saga ([`docs/contratos/http-interno.md`](https://github.com/engineercodeprojects/fase-04-soat-fiap-oficina-os-service/blob/main/docs/contratos/http-interno.md)): ele **chama** a Execução nos comandos e a Execução **responde por callback** às ações do mecânico.
+O OS Service é o orquestrador da saga ([`docs/contratos/http-interno.md`](https://github.com/guilhermeqmaia/soat-fiap-oficina-os-service/blob/main/docs/contratos/http-interno.md)): ele **chama** a Execução nos comandos e a Execução **responde por callback** às ações do mecânico.
 
 ```mermaid
 sequenceDiagram
