@@ -274,7 +274,7 @@ O SonarCloud recebe os dois relatórios (`coverage/unit/lcov.info` e `coverage/i
 
 | Suíte                                  | Resultado (15/11/2026)                                          |
 | -------------------------------------- | --------------------------------------------------------------- |
-| Unitários (`test:unit:cov`)            | 118 testes, 99,43% de linhas (gate 80%)                         |
+| Unitários (`test:unit:cov`)            | 119 testes, 99,43% de linhas (gate 80%)                         |
 | Integração (`test:integration`)        | 13 testes contra o DynamoDB Local                               |
 | BDD (`test:bdd`)                       | 21 cenários, 249 passos                                         |
 | SonarCloud (`main`, unit + integração) | 95,4% de cobertura, quality gate OK, 0 bugs, 0 vulnerabilidades |
