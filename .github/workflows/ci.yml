@@ -48,7 +48,8 @@ jobs:
         with: { fetch-depth: 0 }
       - uses: actions/setup-node@v4
         with: { node-version: '20', cache: npm }
-      - run: npm ci && npm run test:unit:cov
+      # Unit + integracao (DynamoDB Local via testcontainers): o Sonar soma os dois lcov.
+      - run: npm ci && npm run test:all:cov
       - name: Analise
         if: ${{ env.SONAR_TOKEN != '' }}
         uses: SonarSource/sonarqube-scan-action@v5

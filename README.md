@@ -28,7 +28,7 @@ src/
 | `application`    | Casos de uso, `EstoqueService`, porta `OsServiceGateway`                               | `domain`, `@nestjs/common`                          |
 | `infrastructure` | Controllers + DTOs (class-validator/Swagger), repositórios DynamoDB, `OsServiceClient` | tudo                                                |
 
-`src/shared/architecture.spec.ts` quebra o build se a regra de dependência for violada. Erros de domínio (`DomainError`) viram HTTP no `DomainExceptionFilter` do kit (400/403/404/409); nas rotas `/execucao/ordens`, o `409` leva `{ motivo }` (contrato interno) e OS Service indisponível vira **502**.
+`src/shared/architecture.spec.ts` quebra o build se a regra de dependência for violada. Erros de domínio (`DomainError`) viram HTTP no `DomainExceptionFilter` do kit (400/403/404/409); nas rotas `/execucao/ordens`, o `409` leva `{ motivo }` (contrato interno), OS Service indisponível vira **502** e conflito de versão que sobra após as retentativas vira **503** (`Retry-After`), que o cliente do OS repete.
 
 ## Modelo de dados (DynamoDB)
 
@@ -42,8 +42,9 @@ Nome físico = `DYNAMODB_TABLE_PREFIX` + nome base (ou override completo `DYNAMO
 | `movimentacoes_estoque` | `movimentacaoId` (HASH) | `osId-data-index` (`osId`+`data`), `produtoId-data-index` (`produtoId`+`data`) | `{ movimentacaoId, produtoId, tipo (ENTRADA \| BAIXA \| DEVOLUCAO), quantidade, osId, servicoId, data }`                                                       |
 
 - `servicos[]` da execução é um **snapshot**: `{ servicoId, nome, preco, produtos: [{ produtoId, nome, sku, precoUnitario, quantidade }] }` — preço congelado no vínculo; editar/remover o catálogo não altera OS em andamento.
-- `versao` = **lock otimista** (`ConditionExpression: versao = :lida`): duas operações concorrentes na mesma OS → a segunda recebe `409`.
-- O GSI `osId-data-index` sustenta o rollback (todas as movimentações da OS); `produtoId-data-index`, o extrato por produto. Movimentações `ENTRADA` (sem OS) não têm `osId` e ficam fora do índice por OS.
+- `versao` = **lock otimista** (`ConditionExpression: versao = :lida`). Nas rotas do OS Service (`enfileirar`, `iniciar`, `DELETE`) o caso de uso é relido e repetido até 3 vezes; se o conflito persistir, `503`. Nunca `409 { motivo }`, que o OS leria como recusa de negócio e cancelaria a OS.
+- `baixaId` (= `<numeroOS>@v<versao>` no fechamento do diagnóstico) e `callbackPendente` (envelope ainda não confirmado pelo OS) ficam no item da execução.
+- O GSI `osId-data-index` sustenta o extrato da OS (`GET .../movimentacoes`); `produtoId-data-index`, o extrato por produto. O rollback **não** usa o GSI (eventualmente consistente). Movimentações `ENTRADA` (sem OS) não têm `osId` e ficam fora do índice por OS.
 - Listagens do catálogo usam `Scan` paginado (catálogos pequenos); unicidade de SKU é checada por `Scan` — para escalar, um GSI em `sku` no infra-db.
 
 ### Transações de estoque
@@ -56,7 +57,9 @@ Baixa, devolução e entrada usam **um único `TransactWriteItems`** (tudo ou na
 
 Se qualquer condição falhar, nada é gravado; `CancellationReasons` (com `ReturnValuesOnConditionCheckFailure: ALL_OLD`) é traduzido para `EstoqueInsuficienteError` (409, com saldo disponível) ou `ProdutoNaoEncontradoError` (404). Antes da transação, o domínio (`validarSaldo`) já valida o saldo para dar a mensagem clara; a condição do banco é a garantia final. Limite: 100 itens por transação.
 
-**Devolução (rollback)** é calculada pelo **líquido do histórico da OS** (Σ BAIXA − Σ DEVOLUCAO por produto × serviço): repetir o rollback não devolve em dobro (idempotente para retries do OS Service).
+**Ids determinísticos:** BAIXA e DEVOLUCAO de um diagnóstico têm `movimentacaoId = <TIPO>#<baixaId>#<produtoId>#<servicoId>`. Com o `attribute_not_exists(movimentacaoId)` da transação, repetir uma baixa ou devolução (retry do OS, retry do SDK, `DELETE`s simultâneos) nunca move o saldo duas vezes: a transação repetida é recusada e tratada como "já feita".
+
+**Devolução (rollback)** parte das BAIXAS do diagnóstico lidas **por id com `ConsistentRead`** (BatchGetItem na tabela base) e gera uma DEVOLUCAO por BAIXA efetivamente gravada. Produto removido do catálogo depois da baixa é pulado (com log) para não travar a devolução das outras peças.
 
 ## Máquina de estados da execução
 
@@ -91,20 +94,25 @@ sequenceDiagram
   E->>O: POST /ordens-servico/{n}/eventos  execucao.diagnostico-concluido
   alt orçamento reprovado / OS cancelada
     O->>E: DELETE /execucao/ordens/{n} {motivo}
-    E->>D: Put execucoes (CANCELADA) + TransactWriteItems (DEVOLUCAO)
+    E->>D: BatchGet (BAIXAs por id, ConsistentRead) + TransactWriteItems (DEVOLUCAO, ids deterministicos)
+    E->>D: Put execucoes (CANCELADA)
     E-->>O: 200 = execucao.reservas-liberadas
   else aprovado
     O->>E: POST /execucao/ordens/{n}/iniciar
-    E-->>O: 200 {numeroOS} = execucao.iniciada (EM_EXECUCAO)
+    E-->>O: 200 {numeroOS, status} = execucao.iniciada (EM_EXECUCAO)
     M->>E: POST /execucao/ordens/{n}/finalizar
     E->>O: POST /ordens-servico/{n}/eventos  execucao.finalizada
   end
 ```
 
 - A **baixa** acontece no fechamento do diagnóstico; a **devolução**, no `DELETE` do OS Service. `iniciar` só muda o status (as peças já foram baixadas).
-- **Consistência:** cada operação grava primeiro o estado local (o lock otimista serializa operações concorrentes e impede baixa em dobro) e só então propaga. Se o callback falhar, o estado local é **restaurado** e as peças baixadas são **devolvidas**. Resposta: `409 { motivo }` se o OS recusou (`400`/`404`/demais 4xx), `502` se ficou indisponível (timeout/rede/5xx após os retries). Exceção: um `409` do OS **não** é recusa, e sim "a OS/saga mudou ao mesmo tempo, repita o callback" — o callback é repetido com o **mesmo envelope** (o OS deduplica pelo `id`) até 3 vezes com backoff (200 ms, 800 ms, 3 s); só se persistir vira `502` e a compensação roda.
+- **Consistência do diagnóstico:** grava o estado local + o envelope do callback como pendente (o lock otimista impede dois fechamentos), baixa as peças e envia o callback.
+  - OS **recusou** (`400`/`404`/demais 4xx): as peças são **devolvidas** e o diagnóstico é **reaberto** (`EM_DIAGNOSTICO`); resposta `409 { motivo }`.
+  - OS **indisponível** (timeout/rede/5xx após os retries): resultado ambíguo, o OS pode ter gerado o orçamento. Diagnóstico e baixa são **mantidos** e a resposta é `502`; o mecânico repete o `POST .../diagnostico` e o **mesmo envelope** é reenviado (o OS deduplica pelo `id`).
+  - No `finalizar`, uma falha ao avisar o OS volta o status para `EM_EXECUCAO`. Exceção: um `409` do OS **não** é recusa, e sim "a OS/saga mudou ao mesmo tempo, repita o callback" — o callback é repetido com o **mesmo envelope** (o OS deduplica pelo `id`) até 3 vezes com backoff (200 ms, 800 ms, 3 s); só se persistir vira `502` e a compensação roda.
 - **Recusa de negócio** = `409 { statusCode, message, motivo }` em todas as rotas de `/execucao/ordens` (o OS lê `motivo` para montar `execucao.recusada`).
-- **Idempotência:** `POST /execucao/ordens` por `numeroOS` (repetir devolve a mesma execução), `iniciar` repetido = `200`, `DELETE` repetido ou sem execução = `200` sem efeito (a devolução é o líquido do histórico).
+- **Idempotência:** `POST /execucao/ordens` por `numeroOS` (repetir ou chamar em paralelo devolve a mesma execução), `iniciar` repetido = `200`, `DELETE` repetido, simultâneo ou sem execução = `200` sem devolver de novo (ids determinísticos). O `DELETE` aceita a execução já `EM_EXECUCAO` (o `iniciar` pode ter sido aplicado com a resposta perdida); só `EXECUTADA` dá `409`.
+- **Diagnóstico:** 5 a 1000 caracteres, a mesma regra do OS Service (senão `400` antes de mexer no estoque).
 
 ## Integração com o OS Service
 
@@ -125,9 +133,9 @@ Todas exigem `Authorization: Bearer <JWT>` (HS256, claims `sub`, `cpf`, `role`, 
 
 | Método e rota                                                    | Roles                       | Descrição                                                                   |
 | ---------------------------------------------------------------- | --------------------------- | --------------------------------------------------------------------------- |
-| `POST /execucao/ordens`                                          | SERVICO, ADMIN              | `execucao.enfileirar` → `201 { numeroOS, posicaoFila }` / `409 { motivo }`  |
-| `POST /execucao/ordens/:numeroOS/iniciar`                        | SERVICO, ADMIN              | `execucao.iniciar` → `EM_EXECUCAO`                                          |
-| `DELETE /execucao/ordens/:numeroOS` `{ motivo? }`                | SERVICO, ADMIN              | `execucao.liberar-reservas`: devolve as peças e marca `CANCELADA`           |
+| `POST /execucao/ordens`                                          | SERVICO                     | `execucao.enfileirar` → `201 { numeroOS, posicaoFila }` / `409 { motivo }`  |
+| `POST /execucao/ordens/:numeroOS/iniciar`                        | SERVICO                     | `execucao.iniciar` → `EM_EXECUCAO`                                          |
+| `DELETE /execucao/ordens/:numeroOS` `{ motivo? }`                | SERVICO                     | `execucao.liberar-reservas`: devolve as peças e marca `CANCELADA`           |
 | `GET /execucao/ordens` `?mecanicoId&status`                      | ADMIN, MECANICO             | Fila (MECANICO vê as suas e as `NA_FILA`)                                   |
 | `GET /execucao/ordens/:numeroOS`                                 | ADMIN, MECANICO, SERVICO    | Detalhe + `valorTotal` (mão de obra + peças)                                |
 | `POST /execucao/ordens/:numeroOS/atribuir-mecanico`              | ADMIN, MECANICO             | Tira da fila (MECANICO só atribui a si mesmo)                               |

@@ -10,6 +10,8 @@ module.exports = {
   collectCoverageFrom: [
     '**/infrastructure/dynamodb-*.repository.ts',
     '**/infrastructure/*.controller.ts',
+    '**/infrastructure/dto/**/*.ts',
+    '**/infrastructure/presenters/**/*.ts',
     'dynamodb/**/*.ts',
     '!dynamodb/create-tables.cli.ts',
   ],
