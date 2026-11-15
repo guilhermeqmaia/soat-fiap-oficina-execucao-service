@@ -31,16 +31,24 @@ export class LiberarExecucaoUseCase implements UseCase<
   ) {}
 
   execute({ osId }: { osId: string; motivo?: string }): Promise<LiberarExecucaoOutput> {
+    // Se esta chamada devolver as pecas e depois perder o lock otimista para outra
+    // chamada simultanea, a retentativa ja ve a execucao CANCELADA: a resposta
+    // ainda precisa informar o que ESTA chamada devolveu.
+    let devolvidasNestaChamada: MovimentacaoEstoque[] = [];
     return comRetentativa(async () => {
       const execucao = await this.repo.buscarPorOsId(osId);
-      if (!execucao) return { execucao: null, devolucoes: [] };
+      if (!execucao) return { execucao: null, devolucoes: devolvidasNestaChamada };
       execucao.exigirCancelavel();
-      const devolucoes =
-        execucao.estoqueBaixado && execucao.baixaId
-          ? await this.estoque.devolverDaOs(osId, execucao.baixaId, execucao.itensDeEstoque())
-          : [];
+      if (execucao.estoqueBaixado && execucao.baixaId) {
+        const devolucoes = await this.estoque.devolverDaOs(
+          osId,
+          execucao.baixaId,
+          execucao.itensDeEstoque(),
+        );
+        if (devolucoes.length) devolvidasNestaChamada = devolucoes;
+      }
       if (execucao.cancelar()) await this.repo.salvar(execucao);
-      return { execucao, devolucoes };
+      return { execucao, devolucoes: devolvidasNestaChamada };
     });
   }
 }
