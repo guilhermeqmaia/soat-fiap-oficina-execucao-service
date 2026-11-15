@@ -38,13 +38,16 @@ const diagnostico = {
   ],
 };
 
+const enviarDiagnostico = (c: OsServiceClient) =>
+  c.enviar(c.montarDiagnosticoConcluido(diagnostico));
+
 describe('OsServiceClient (callbacks RFC-0008)', () => {
   beforeAll(() => os.iniciar());
   afterEach(() => os.limpar());
   afterAll(() => os.parar());
 
   it('POST /ordens-servico/{numero}/eventos com envelope, JWT de servico e correlation id', async () => {
-    await cliente().diagnosticoConcluido(diagnostico);
+    await enviarDiagnostico(cliente());
     const [r] = os.recebidas;
     expect(r).toMatchObject({
       method: 'POST',
@@ -61,6 +64,17 @@ describe('OsServiceClient (callbacks RFC-0008)', () => {
     expect(r.headers['x-correlation-id']).toBe('OS 1');
   });
 
+  it('reenviar o mesmo envelope repete o mesmo id (o OS deduplica)', async () => {
+    const c = cliente();
+    const envelope = c.montarDiagnosticoConcluido(diagnostico);
+    await c.enviar(envelope);
+    await c.enviar(envelope);
+    expect(os.recebidas.map((r) => (r.body as { id: string }).id)).toEqual([
+      envelope.id,
+      envelope.id,
+    ]);
+  });
+
   it('execucao.finalizada', async () => {
     await cliente().execucaoFinalizada({ numeroOS: '7', finalizadaEm: '2026-01-01T00:00:00.000Z' });
     expect(os.recebidas[0].body).toMatchObject({
@@ -71,20 +85,20 @@ describe('OsServiceClient (callbacks RFC-0008)', () => {
 
   it('400/404 viram OsServiceRecusouError sem retry (usa `motivo` ou `message`)', async () => {
     os.responder({ status: 404, body: { motivo: 'OS nao encontrada' } });
-    await expect(cliente().diagnosticoConcluido(diagnostico)).rejects.toEqual(
+    await expect(enviarDiagnostico(cliente())).rejects.toEqual(
       new OsServiceRecusouError(404, 'OS nao encontrada'),
     );
     expect(os.recebidas).toHaveLength(1);
     os.responder({ status: 404, body: { message: ['nao achei'] } });
-    await expect(cliente().diagnosticoConcluido(diagnostico)).rejects.toThrow('nao achei');
+    await expect(enviarDiagnostico(cliente())).rejects.toThrow('nao achei');
     os.responder({ status: 400 });
-    await expect(cliente().diagnosticoConcluido(diagnostico)).rejects.toThrow('sem detalhes');
+    await expect(enviarDiagnostico(cliente())).rejects.toThrow('sem detalhes');
   });
 
   it('409 e transitorio: repete o MESMO envelope com backoff e passa quando o OS aceita', async () => {
     os.responder({ status: 409, body: { motivo: 'repita o callback' } }, { status: 200 });
     const c = cliente();
-    await expect(c.diagnosticoConcluido(diagnostico)).resolves.toBeUndefined();
+    await expect(enviarDiagnostico(c)).resolves.toBeUndefined();
     expect(os.recebidas).toHaveLength(2);
     expect(os.recebidas[1].body).toEqual(os.recebidas[0].body);
     expect(c.esperas).toEqual([BACKOFF_CONFLITO_MS[0]]);
@@ -93,7 +107,7 @@ describe('OsServiceClient (callbacks RFC-0008)', () => {
   it('409 persistente (4x) vira OsServiceIndisponivelError (502, compensacao local)', async () => {
     os.responder({ status: 409 }, { status: 409 }, { status: 409 }, { status: 409 });
     const c = cliente();
-    const erro = await c.diagnosticoConcluido(diagnostico).catch((e: unknown) => e);
+    const erro = await enviarDiagnostico(c).catch((e: unknown) => e);
     expect(erro).toBeInstanceOf(OsServiceIndisponivelError);
     expect((erro as Error).message).toMatch(/409.*4 vezes/);
     expect(os.recebidas).toHaveLength(4);
@@ -103,12 +117,10 @@ describe('OsServiceClient (callbacks RFC-0008)', () => {
 
   it('5xx: retry e depois OsServiceIndisponivelError; 5xx seguido de sucesso passa', async () => {
     os.responder({ status: 503 }, { status: 503 });
-    await expect(cliente().diagnosticoConcluido(diagnostico)).rejects.toBeInstanceOf(
-      OsServiceIndisponivelError,
-    );
+    await expect(enviarDiagnostico(cliente())).rejects.toBeInstanceOf(OsServiceIndisponivelError);
     expect(os.recebidas).toHaveLength(2);
     os.responder({ status: 500 }, { status: 200 });
-    await expect(cliente().diagnosticoConcluido(diagnostico)).resolves.toBeUndefined();
+    await expect(enviarDiagnostico(cliente())).resolves.toBeUndefined();
   });
 
   it('aguardar() real espera via setTimeout', async () => {
@@ -121,7 +133,7 @@ describe('OsServiceClient (callbacks RFC-0008)', () => {
   });
 
   it('sem OS_SERVICE_URL o callback e ignorado (dev)', async () => {
-    await expect(cliente('').diagnosticoConcluido(diagnostico)).resolves.toBeUndefined();
+    await expect(enviarDiagnostico(cliente(''))).resolves.toBeUndefined();
     expect(os.recebidas).toEqual([]);
   });
 });

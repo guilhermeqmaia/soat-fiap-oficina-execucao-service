@@ -64,14 +64,19 @@ describe('casos de uso de Produto/Estoque', () => {
     );
 
     const servico = new EstoqueService(estoque, estoque);
-    expect(await servico.baixarParaOs('OS-1', [])).toEqual([]);
-    await servico.baixarParaOs('OS-1', [{ produtoId: p.produtoId, servicoId: 's', quantidade: 1 }]);
+    expect(await servico.baixarParaOs('OS-1', 'OS-1@v1', [])).toEqual([]);
+    const itens = [{ produtoId: p.produtoId, servicoId: 's', quantidade: 1 }];
+    await servico.baixarParaOs('OS-1', 'OS-1@v1', itens);
+    // repetir a mesma baixa nao baixa de novo
+    await servico.baixarParaOs('OS-1', 'OS-1@v1', itens);
+    expect(estoque.saldo(p.produtoId)).toBe(3);
     const listar = new ListarMovimentacoesUseCase(estoque);
     expect((await listar.execute({ produtoId: p.produtoId })).map((m) => m.tipo)).toEqual([
       TipoMovimentacao.ENTRADA,
       TipoMovimentacao.BAIXA,
     ]);
     expect(await listar.execute({ osId: 'OS-1' })).toHaveLength(1);
-    expect(await servico.devolverDaOs('OS-2')).toEqual([]);
+    expect(await servico.devolverDaOs('OS-2', 'OS-2@v1', itens)).toEqual([]);
+    expect(await servico.devolverDaOs('OS-1', 'OS-1@v1', [])).toEqual([]);
   });
 });

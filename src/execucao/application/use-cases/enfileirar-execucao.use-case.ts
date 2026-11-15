@@ -4,6 +4,7 @@ import { ConflitoDeNegocioError } from '../../../shared/domain/erros-de-dominio'
 import { Execucao } from '../../domain/execucao.entity';
 import { StatusExecucao, emAndamento } from '../../domain/status-execucao';
 import { EXECUCAO_REPOSITORY, ExecucaoRepository } from '../../domain/execucao.repository';
+import { comRetentativa } from '../com-retentativa';
 
 export interface EnfileirarExecucaoInput {
   numeroOS: string;
@@ -28,7 +29,16 @@ export class EnfileirarExecucaoUseCase implements UseCase<
 > {
   constructor(@Inject(EXECUCAO_REPOSITORY) private readonly repo: ExecucaoRepository) {}
 
-  async execute(input: EnfileirarExecucaoInput): Promise<EnfileirarExecucaoOutput> {
+  /**
+   * Duas chamadas simultaneas para a mesma OS: a segunda perde o
+   * `attribute_not_exists` e, na retentativa, encontra a execucao criada pela
+   * primeira e devolve a mesma resposta (idempotente).
+   */
+  execute(input: EnfileirarExecucaoInput): Promise<EnfileirarExecucaoOutput> {
+    return comRetentativa(() => this.enfileirar(input));
+  }
+
+  private async enfileirar(input: EnfileirarExecucaoInput): Promise<EnfileirarExecucaoOutput> {
     let execucao = await this.repo.buscarPorOsId(input.numeroOS);
     if (!execucao) {
       const doVeiculo = await this.repo.listar({ veiculoId: input.veiculoId });

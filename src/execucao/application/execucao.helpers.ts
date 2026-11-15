@@ -34,8 +34,12 @@ export async function persistirEPropagar(
   try {
     await propagar();
   } catch (erro) {
-    if (compensar) await compensar();
-    await restaurar(repo, execucao, anterior);
+    try {
+      if (compensar) await compensar();
+    } finally {
+      // Restaura mesmo se a compensacao falhar; o erro original e o que sobe.
+      await restaurar(repo, execucao, anterior);
+    }
     throw erro;
   }
 }

@@ -1,18 +1,20 @@
 import { Produto } from './produto.entity';
 import { TipoMovimentacao as T, deltaDoSaldo } from './movimentacao-estoque';
-import { consolidarPorProduto, planejarBaixa, planejarDevolucao, validarSaldo } from './estoque';
+import {
+  consolidarPorProduto,
+  idMovimentacao,
+  planejarBaixa,
+  planejarDevolucao,
+  validarSaldo,
+} from './estoque';
 import { EstoqueInsuficienteError } from './errors/estoque-insuficiente.error';
 import { ProdutoNaoEncontradoError } from './errors/produto-nao-encontrado.error';
 import { DadoInvalidoError } from '../../shared/domain/erros-de-dominio';
 
-let seq = 0;
-const id = () => `m${++seq}`;
 const produto = (produtoId: string, quantidadeEstoque: number) =>
   Produto.criar({ produtoId, nome: produtoId, sku: produtoId, preco: 10, quantidadeEstoque });
 
 describe('estoque (dominio)', () => {
-  beforeEach(() => (seq = 0));
-
   it('deltaDoSaldo: BAIXA subtrai, ENTRADA/DEVOLUCAO somam', () => {
     expect(deltaDoSaldo({ tipo: T.BAIXA, quantidade: 2 })).toBe(-2);
     expect(deltaDoSaldo({ tipo: T.DEVOLUCAO, quantidade: 2 })).toBe(2);
@@ -72,20 +74,20 @@ describe('estoque (dominio)', () => {
   });
 
   describe('planejarBaixa', () => {
-    it('gera uma BAIXA por (produto, servico), agregando repetidos', () => {
+    it('gera uma BAIXA por (produto, servico), agregando repetidos, com id deterministico', () => {
       const movs = planejarBaixa(
         'OS-1',
+        'OS-1@v3',
         [
           { produtoId: 'p1', servicoId: 's1', quantidade: 1 },
           { produtoId: 'p1', servicoId: 's1', quantidade: 2 },
           { produtoId: 'p1', servicoId: 's2', quantidade: 1 },
         ],
-        id,
         new Date('2026-01-01T00:00:00Z'),
       );
       expect(movs).toEqual([
         {
-          movimentacaoId: 'm1',
+          movimentacaoId: 'BAIXA#OS-1@v3#p1#s1',
           produtoId: 'p1',
           tipo: T.BAIXA,
           quantidade: 3,
@@ -94,7 +96,7 @@ describe('estoque (dominio)', () => {
           data: '2026-01-01T00:00:00.000Z',
         },
         {
-          movimentacaoId: 'm2',
+          movimentacaoId: 'BAIXA#OS-1@v3#p1#s2',
           produtoId: 'p1',
           tipo: T.BAIXA,
           quantidade: 1,
@@ -106,45 +108,58 @@ describe('estoque (dominio)', () => {
       expect(consolidarPorProduto(movs).get('p1')).toBe(-4);
     });
 
-    it('rejeita quantidade nao positiva', () => {
+    it('mesmo diagnostico gera os mesmos ids; outro diagnostico gera ids novos', () => {
+      const itens = [{ produtoId: 'p', servicoId: 's', quantidade: 1 }];
+      const ids = (baixaId: string) =>
+        planejarBaixa('OS', baixaId, itens).map((m) => m.movimentacaoId);
+      expect(ids('OS@v1')).toEqual(ids('OS@v1'));
+      expect(ids('OS@v1')).not.toEqual(ids('OS@v5'));
+    });
+
+    it('rejeita quantidade nao positiva e baixaId vazio', () => {
       expect(() =>
-        planejarBaixa('OS', [{ produtoId: 'p', servicoId: 's', quantidade: 0 }], id),
+        planejarBaixa('OS', 'OS@v1', [{ produtoId: 'p', servicoId: 's', quantidade: 0 }]),
       ).toThrow(DadoInvalidoError);
+      expect(() => planejarBaixa('OS', ' ', [])).toThrow(DadoInvalidoError);
     });
   });
 
   describe('planejarDevolucao', () => {
-    const baixas = planejarBaixa(
-      'OS-1',
-      [
-        { produtoId: 'p1', servicoId: 's1', quantidade: 3 },
-        { produtoId: 'p2', servicoId: 's1', quantidade: 1 },
-      ],
-      id,
-    );
+    const baixas = planejarBaixa('OS-1', 'OS-1@v2', [
+      { produtoId: 'p1', servicoId: 's1', quantidade: 3 },
+      { produtoId: 'p2', servicoId: 's1', quantidade: 1 },
+    ]);
 
-    it('devolve o liquido baixado por (produto, servico), ignorando outras OS e entradas', () => {
-      const outra = planejarBaixa(
-        'OS-2',
-        [{ produtoId: 'p1', servicoId: 's1', quantidade: 9 }],
-        id,
-      );
+    it('uma DEVOLUCAO por BAIXA da OS, ignorando outras OS e entradas', () => {
+      const outra = planejarBaixa('OS-2', 'OS-2@v2', [
+        { produtoId: 'p1', servicoId: 's1', quantidade: 9 },
+      ]);
       const entrada = { ...outra[0], movimentacaoId: 'e', tipo: T.ENTRADA, osId: 'OS-1' };
-      const devolucoes = planejarDevolucao('OS-1', [...baixas, ...outra, entrada], id);
-      expect(devolucoes.map((d) => [d.produtoId, d.servicoId, d.tipo, d.quantidade])).toEqual([
-        ['p1', 's1', T.DEVOLUCAO, 3],
-        ['p2', 's1', T.DEVOLUCAO, 1],
+      const devolucoes = planejarDevolucao('OS-1', 'OS-1@v2', [...baixas, ...outra, entrada]);
+      expect(
+        devolucoes.map((d) => [d.movimentacaoId, d.produtoId, d.servicoId, d.tipo, d.quantidade]),
+      ).toEqual([
+        [idMovimentacao(T.DEVOLUCAO, 'OS-1@v2', 'p1', 's1'), 'p1', 's1', T.DEVOLUCAO, 3],
+        [idMovimentacao(T.DEVOLUCAO, 'OS-1@v2', 'p2', 's1'), 'p2', 's1', T.DEVOLUCAO, 1],
       ]);
       expect(consolidarPorProduto(devolucoes).get('p1')).toBe(3);
     });
 
-    it('e idempotente: depois de devolver tudo nao gera nada', () => {
-      const devolucoes = planejarDevolucao('OS-1', baixas, id);
-      expect(planejarDevolucao('OS-1', [...baixas, ...devolucoes], id)).toEqual([]);
+    it('ids deterministicos: planejar de novo gera os mesmos ids (a transacao barra a repeticao)', () => {
+      expect(planejarDevolucao('OS-1', 'OS-1@v2', baixas)).toEqual(
+        planejarDevolucao('OS-1', 'OS-1@v2', baixas, new Date(0)).map((d) => ({
+          ...d,
+          data: expect.any(String),
+        })),
+      );
     });
 
-    it('sem historico, nada a devolver', () => {
-      expect(planejarDevolucao('OS-1', [], id)).toEqual([]);
+    it('sem baixas, nada a devolver', () => {
+      expect(planejarDevolucao('OS-1', 'OS-1@v2', [])).toEqual([]);
+    });
+
+    it('servico nulo vira "-" no id', () => {
+      expect(idMovimentacao(T.BAIXA, 'b', 'p', null)).toBe('BAIXA#b#p#-');
     });
   });
 });

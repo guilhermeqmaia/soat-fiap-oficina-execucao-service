@@ -1,5 +1,6 @@
 import { Inject, Injectable } from '@nestjs/common';
 import {
+  BatchGetCommand,
   DynamoDBDocumentClient,
   QueryCommand,
   TransactWriteCommand,
@@ -15,9 +16,12 @@ import { EstoqueRepository } from '../domain/produto.repository';
 import { consolidarPorProduto } from '../domain/estoque';
 import { EstoqueInsuficienteError, ItemEmFalta } from '../domain/errors/estoque-insuficiente.error';
 import { ProdutoNaoEncontradoError } from '../domain/errors/produto-nao-encontrado.error';
+import { MovimentacaoJaRegistradaError } from '../domain/errors/movimentacao-ja-registrada.error';
 
 /** Limite de itens por TransactWriteItems no DynamoDB. */
 export const LIMITE_ITENS_TRANSACAO = 100;
+/** Limite de chaves por BatchGetItem no DynamoDB. */
+const LIMITE_CHAVES_BATCH_GET = 100;
 
 type Acao = NonNullable<TransactWriteCommandInput['TransactItems']>[number];
 
@@ -29,7 +33,10 @@ type Acao = NonNullable<TransactWriteCommandInput['TransactItems']>[number];
  *   negativo, `quantidadeEstoque >= :necessario` — o saldo nunca fica negativo;
  * - 1 `Put` por movimentacao em `movimentacoes_estoque` (auditoria), com
  *   `attribute_not_exists(movimentacaoId)`.
- * Qualquer condicao falha => nada e gravado.
+ * Qualquer condicao falha => nada e gravado. Como os ids de baixa/devolucao sao
+ * deterministicos, um `Put` recusado significa "esta movimentacao ja foi
+ * aplicada" (MovimentacaoJaRegistradaError) — inclusive quando o proprio SDK
+ * repete uma transacao que ja tinha sido gravada.
  */
 @Injectable()
 export class DynamoDbEstoqueRepository implements EstoqueRepository {
@@ -78,8 +85,35 @@ export class DynamoDbEstoqueRepository implements EstoqueRepository {
         new TransactWriteCommand({ TransactItems: [...atualizacoes, ...registros] }),
       );
     } catch (e) {
-      throw this.traduzirCancelamento(e, deltas);
+      throw this.traduzirCancelamento(e, deltas, movimentacoes);
     }
+  }
+
+  async buscarMovimentacoes(movimentacaoIds: string[]): Promise<MovimentacaoEstoque[]> {
+    const ids = [...new Set(movimentacaoIds)];
+    const encontradas: MovimentacaoEstoque[] = [];
+    for (let i = 0; i < ids.length; i += LIMITE_CHAVES_BATCH_GET) {
+      let chaves: Record<string, unknown>[] | undefined = ids
+        .slice(i, i + LIMITE_CHAVES_BATCH_GET)
+        .map((movimentacaoId) => ({ movimentacaoId }));
+      while (chaves?.length) {
+        const tabela = this.tabelas.movimentacoesEstoque;
+        const { Responses, UnprocessedKeys } = await this.client.send(
+          new BatchGetCommand({
+            RequestItems: { [tabela]: { Keys: chaves, ConsistentRead: true } },
+          }),
+        );
+        for (const item of Responses?.[tabela] ?? []) {
+          encontradas.push({
+            osId: null,
+            servicoId: null,
+            ...item,
+          } as unknown as MovimentacaoEstoque);
+        }
+        chaves = UnprocessedKeys?.[tabela]?.Keys as Record<string, unknown>[] | undefined;
+      }
+    }
+    return encontradas;
   }
 
   async listarPorOs(osId: string): Promise<MovimentacaoEstoque[]> {
@@ -113,9 +147,18 @@ export class DynamoDbEstoqueRepository implements EstoqueRepository {
   }
 
   /** Mapeia `CancellationReasons` (mesma ordem de TransactItems) para erros de dominio. */
-  private traduzirCancelamento(e: unknown, deltas: [string, number][]): unknown {
+  private traduzirCancelamento(
+    e: unknown,
+    deltas: [string, number][],
+    movimentacoes: MovimentacaoEstoque[],
+  ): unknown {
     if (!(e instanceof TransactionCanceledException)) return e;
     const motivos = e.CancellationReasons ?? [];
+    for (let i = 0; i < movimentacoes.length; i++) {
+      if (motivos[deltas.length + i]?.Code === 'ConditionalCheckFailed') {
+        return new MovimentacaoJaRegistradaError(movimentacoes[i].movimentacaoId);
+      }
+    }
     const emFalta: ItemEmFalta[] = [];
     for (let i = 0; i < deltas.length; i++) {
       if (motivos[i]?.Code !== 'ConditionalCheckFailed') continue;

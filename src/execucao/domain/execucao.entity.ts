@@ -29,6 +29,16 @@ export interface ExecucaoProps {
   diagnostico: string | null;
   servicos: ServicoDaExecucao[];
   estoqueBaixado: boolean;
+  /**
+   * Identifica a baixa de estoque do diagnostico atual (entra no id das
+   * movimentacoes). Mantido apos o cancelamento para auditoria.
+   */
+  baixaId: string | null;
+  /**
+   * Envelope do callback `execucao.diagnostico-concluido` ainda nao confirmado
+   * pelo OS Service (timeout/5xx). Reenviado com o MESMO id, que o OS deduplica.
+   */
+  callbackPendente: CallbackPendente | null;
   finalizadaEm: string | null;
   createdAt: string;
   updatedAt: string;
@@ -45,17 +55,34 @@ export interface ItemDiagnostico {
   servicoId?: string;
 }
 
+/** Envelope serializado de um callback ao OS Service (formato do kit `/http`). */
+export interface CallbackPendente {
+  id: string;
+  type: string;
+  [campo: string]: unknown;
+}
+
+/** Limites do texto do diagnostico — os mesmos do OS Service (`registrarDiagnostico`). */
+export const DIAGNOSTICO_MIN = 5;
+export const DIAGNOSTICO_MAX = 1000;
+
 export interface ItemDeEstoqueDaExecucao {
   produtoId: string;
   servicoId: string;
   quantidade: number;
 }
 
+/**
+ * O OS Service pode compensar ate o passo INICIAR_EXECUCAO: se o `iniciar` ja
+ * foi aplicado aqui e a resposta se perdeu, o cancelamento chega com a execucao
+ * EM_EXECUCAO e precisa ser aceito (contrato: o DELETE nao falha).
+ */
 const STATUS_CANCELAVEIS = [
   StatusExecucao.NA_FILA,
   StatusExecucao.ATRIBUIDA,
   StatusExecucao.EM_DIAGNOSTICO,
   StatusExecucao.AGUARDANDO_APROVACAO,
+  StatusExecucao.EM_EXECUCAO,
 ];
 
 /**
@@ -81,6 +108,8 @@ export class Execucao {
       diagnostico: null,
       servicos: [],
       estoqueBaixado: false,
+      baixaId: null,
+      callbackPendente: null,
       finalizadaEm: null,
       createdAt: iso,
       updatedAt: iso,
@@ -89,7 +118,14 @@ export class Execucao {
   }
 
   static reconstituir(props: ExecucaoProps): Execucao {
-    return new Execucao(structuredClone(props));
+    // Itens gravados antes de baixaId/callbackPendente existirem.
+    return new Execucao(
+      structuredClone({
+        ...props,
+        baixaId: props.baixaId ?? null,
+        callbackPendente: props.callbackPendente ?? null,
+      }),
+    );
   }
 
   /** Atribui (NA_FILA -> ATRIBUIDA) ou troca o mecanico enquanto o diagnostico esta aberto. */
@@ -139,16 +175,58 @@ export class Execucao {
     this.tocar(agora);
   }
 
-  /** Conclui o diagnostico (-> AGUARDANDO_APROVACAO). Devolve as pecas a baixar. */
+  /**
+   * Conclui o diagnostico (-> AGUARDANDO_APROVACAO) e abre uma baixa nova
+   * (`baixaId` unico por versao). Devolve as pecas a baixar.
+   */
   concluirDiagnostico(diagnostico: string, agora: Date = new Date()): ItemDeEstoqueDaExecucao[] {
     if (!this.props.servicos.length) {
       throw new DadoInvalidoError('Diagnostico sem servicos: vincule ao menos um servico a OS');
     }
     const texto = exigirTexto(diagnostico, 'diagnostico');
+    if (texto.length < DIAGNOSTICO_MIN || texto.length > DIAGNOSTICO_MAX) {
+      throw new DadoInvalidoError(
+        `diagnostico deve ter entre ${DIAGNOSTICO_MIN} e ${DIAGNOSTICO_MAX} caracteres`,
+      );
+    }
     this.transitarPara(StatusExecucao.AGUARDANDO_APROVACAO, agora);
     this.props.diagnostico = texto;
     this.props.estoqueBaixado = true;
+    this.props.baixaId = `${this.props.osId}@v${this.props.versao}`;
+    this.props.callbackPendente = null;
     return this.itensDeEstoque();
+  }
+
+  /** Guarda o envelope do callback do diagnostico ate o OS Service confirmar. */
+  registrarCallbackPendente(envelope: CallbackPendente, agora: Date = new Date()): void {
+    this.props.callbackPendente = structuredClone(envelope);
+    this.tocar(agora);
+  }
+
+  /** O OS Service confirmou o callback pendente. */
+  confirmarCallback(agora: Date = new Date()): void {
+    this.props.callbackPendente = null;
+    this.tocar(agora);
+  }
+
+  /**
+   * Compensacao do diagnostico quando o OS Service o recusa (4xx): volta para
+   * EM_DIAGNOSTICO com os mesmos servicos/pecas, sem baixa e sem laudo, para o
+   * mecanico corrigir e concluir de novo. As pecas sao devolvidas por quem chama.
+   */
+  reabrirDiagnostico(agora: Date = new Date()): void {
+    this.transitarPara(StatusExecucao.EM_DIAGNOSTICO, agora);
+    this.props.diagnostico = null;
+    this.props.estoqueBaixado = false;
+    this.props.baixaId = null;
+    this.props.callbackPendente = null;
+  }
+
+  /** Diagnostico concluido aqui, mas o OS Service ainda nao confirmou o callback. */
+  get aguardandoConfirmacaoDoOs(): boolean {
+    return (
+      this.props.status === StatusExecucao.AGUARDANDO_APROVACAO && !!this.props.callbackPendente
+    );
   }
 
   /** `execucao.iniciar` (orcamento aprovado). Idempotente: false se ja estava em execucao/executada. */
@@ -160,6 +238,8 @@ export class Execucao {
       return false;
     }
     this.transitarPara(StatusExecucao.EM_EXECUCAO, agora);
+    // O `iniciar` so chega depois de o OS aplicar o diagnostico: callback confirmado.
+    this.props.callbackPendente = null;
     return true;
   }
 
@@ -168,14 +248,24 @@ export class Execucao {
     this.props.finalizadaEm = agora.toISOString();
   }
 
-  /** `execucao.liberar-reservas` (OS cancelada/orcamento reprovado). Idempotente. */
-  cancelar(agora: Date = new Date()): boolean {
-    if (this.props.status === StatusExecucao.CANCELADA) return false;
+  /** Lanca se a execucao nao pode mais ser cancelada (EXECUTADA). CANCELADA passa (idempotente). */
+  exigirCancelavel(): void {
+    if (this.props.status === StatusExecucao.CANCELADA) return;
     if (!STATUS_CANCELAVEIS.includes(this.props.status)) {
       throw new TransicaoDeStatusInvalidaError(this.props.status, StatusExecucao.CANCELADA);
     }
+  }
+
+  /**
+   * `execucao.liberar-reservas` (OS cancelada/orcamento reprovado). Idempotente.
+   * As pecas sao devolvidas por quem chama ANTES de gravar o cancelamento.
+   */
+  cancelar(agora: Date = new Date()): boolean {
+    if (this.props.status === StatusExecucao.CANCELADA) return false;
+    this.exigirCancelavel();
     this.transitarPara(StatusExecucao.CANCELADA, agora);
     this.props.estoqueBaixado = false;
+    this.props.callbackPendente = null;
     return true;
   }
 
@@ -254,6 +344,15 @@ export class Execucao {
   }
   get servicos(): readonly ServicoDaExecucao[] {
     return this.props.servicos;
+  }
+  get estoqueBaixado() {
+    return this.props.estoqueBaixado;
+  }
+  get baixaId() {
+    return this.props.baixaId;
+  }
+  get callbackPendente(): CallbackPendente | null {
+    return this.props.callbackPendente ? structuredClone(this.props.callbackPendente) : null;
   }
 
   /** Chamado pelo repositorio apos gravar (lock otimista). */

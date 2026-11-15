@@ -16,6 +16,8 @@ describe('maquina de estados da execucao', () => {
     [S.AGUARDANDO_APROVACAO, S.EM_EXECUCAO],
     [S.AGUARDANDO_APROVACAO, S.CANCELADA],
     [S.EM_EXECUCAO, S.EXECUTADA],
+    [S.EM_EXECUCAO, S.CANCELADA],
+    [S.AGUARDANDO_APROVACAO, S.EM_DIAGNOSTICO],
   ])('permite %s -> %s', (de, para) => expect(podeTransitar(de, para)).toBe(true));
 
   it.each([
@@ -23,7 +25,7 @@ describe('maquina de estados da execucao', () => {
     [S.ATRIBUIDA, S.EM_EXECUCAO],
     [S.EM_DIAGNOSTICO, S.EXECUTADA],
     [S.AGUARDANDO_APROVACAO, S.EXECUTADA],
-    [S.EM_EXECUCAO, S.CANCELADA],
+    [S.EXECUTADA, S.CANCELADA],
     [S.EXECUTADA, S.EM_EXECUCAO],
     [S.CANCELADA, S.ATRIBUIDA],
   ])('bloqueia %s -> %s', (de, para) => expect(podeTransitar(de, para)).toBe(false));

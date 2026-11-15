@@ -17,7 +17,9 @@ export enum StatusExecucao {
  *                                                     cancelada / orcamento reprovado)
  *
  * NA_FILA: enfileirada pelo OS Service, sem mecanico. ATRIBUIDA -> AGUARDANDO_APROVACAO
- * tambem e permitido. EXECUTADA e CANCELADA sao finais.
+ * tambem e permitido. AGUARDANDO_APROVACAO -> EM_DIAGNOSTICO so na compensacao (OS
+ * recusou o diagnostico). EM_EXECUCAO -> CANCELADA cobre o cancelamento que chega
+ * depois de um `iniciar` cuja resposta se perdeu. EXECUTADA e CANCELADA sao finais.
  */
 export const TRANSICOES_PERMITIDAS: Readonly<Record<StatusExecucao, readonly StatusExecucao[]>> = {
   [StatusExecucao.NA_FILA]: [StatusExecucao.ATRIBUIDA, StatusExecucao.CANCELADA],
@@ -27,8 +29,13 @@ export const TRANSICOES_PERMITIDAS: Readonly<Record<StatusExecucao, readonly Sta
     StatusExecucao.CANCELADA,
   ],
   [StatusExecucao.EM_DIAGNOSTICO]: [StatusExecucao.AGUARDANDO_APROVACAO, StatusExecucao.CANCELADA],
-  [StatusExecucao.AGUARDANDO_APROVACAO]: [StatusExecucao.EM_EXECUCAO, StatusExecucao.CANCELADA],
-  [StatusExecucao.EM_EXECUCAO]: [StatusExecucao.EXECUTADA],
+  [StatusExecucao.AGUARDANDO_APROVACAO]: [
+    StatusExecucao.EM_EXECUCAO,
+    StatusExecucao.CANCELADA,
+    // Compensacao: o OS Service recusou o diagnostico -> o mecanico corrige e conclui de novo.
+    StatusExecucao.EM_DIAGNOSTICO,
+  ],
+  [StatusExecucao.EM_EXECUCAO]: [StatusExecucao.EXECUTADA, StatusExecucao.CANCELADA],
   [StatusExecucao.EXECUTADA]: [],
   [StatusExecucao.CANCELADA]: [],
 };

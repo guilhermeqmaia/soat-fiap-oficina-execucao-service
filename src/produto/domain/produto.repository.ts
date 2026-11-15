@@ -21,10 +21,15 @@ export interface EstoqueRepository {
   /**
    * Aplica as movimentacoes atomicamente (tudo ou nada): ajusta o saldo de cada
    * produto e grava o registro de auditoria. Lanca EstoqueInsuficienteError se
-   * alguma baixa deixaria saldo negativo, e ProdutoNaoEncontradoError se o produto
-   * nao existe.
+   * alguma baixa deixaria saldo negativo, ProdutoNaoEncontradoError se o produto
+   * nao existe e MovimentacaoJaRegistradaError se alguma movimentacao ja existe.
    */
   aplicar(movimentacoes: MovimentacaoEstoque[]): Promise<void>;
+  /**
+   * Busca movimentacoes pelo id com leitura fortemente consistente (tabela base,
+   * nao o indice por OS). Ids inexistentes sao ignorados.
+   */
+  buscarMovimentacoes(movimentacaoIds: string[]): Promise<MovimentacaoEstoque[]>;
   listarPorOs(osId: string): Promise<MovimentacaoEstoque[]>;
   listarPorProduto(produtoId: string): Promise<MovimentacaoEstoque[]>;
 }

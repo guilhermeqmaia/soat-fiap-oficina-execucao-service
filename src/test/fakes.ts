@@ -1,4 +1,5 @@
-import { Execucao } from '../execucao/domain/execucao.entity';
+import { randomUUID } from 'crypto';
+import { CallbackPendente, Execucao } from '../execucao/domain/execucao.entity';
 import { ExecucaoRepository, FiltroExecucoes } from '../execucao/domain/execucao.repository';
 import { ExecucaoAlteradaConcorrentementeError } from '../execucao/domain/errors/execucao-alterada-concorrentemente.error';
 import {
@@ -11,6 +12,7 @@ import { MovimentacaoEstoque, deltaDoSaldo } from '../produto/domain/movimentaca
 import { consolidarPorProduto } from '../produto/domain/estoque';
 import { EstoqueInsuficienteError } from '../produto/domain/errors/estoque-insuficiente.error';
 import { ProdutoNaoEncontradoError } from '../produto/domain/errors/produto-nao-encontrado.error';
+import { MovimentacaoJaRegistradaError } from '../produto/domain/errors/movimentacao-ja-registrada.error';
 import { Servico } from '../servico/domain/servico.entity';
 import { ServicoRepository } from '../servico/domain/servico.repository';
 
@@ -75,6 +77,10 @@ export class InMemoryEstoque implements ProdutoRepository, EstoqueRepository {
       this.falharProximaAplicacao = undefined;
       throw e;
     }
+    const repetida = movs.find((m) =>
+      this.movimentacoes.some((x) => x.movimentacaoId === m.movimentacaoId),
+    );
+    if (repetida) throw new MovimentacaoJaRegistradaError(repetida.movimentacaoId);
     const deltas = consolidarPorProduto(movs);
     for (const [id, delta] of deltas) {
       const p = this.produtos.get(id);
@@ -95,6 +101,9 @@ export class InMemoryEstoque implements ProdutoRepository, EstoqueRepository {
       );
       this.movimentacoes.push(m);
     }
+  }
+  async buscarMovimentacoes(ids: string[]) {
+    return this.movimentacoes.filter((m) => ids.includes(m.movimentacaoId));
   }
   async listarPorOs(osId: string) {
     return this.movimentacoes.filter((m) => m.osId === osId);
@@ -136,11 +145,21 @@ export class InMemoryExecucaoRepository implements ExecucaoRepository {
 
 export class FakeOsGateway implements OsServiceGateway {
   readonly diagnosticos: DiagnosticoConcluido[] = [];
+  /** Ids dos envelopes enviados (um reenvio repete o id). */
+  readonly envelopesEnviados: string[] = [];
   readonly finalizadas: { numeroOS: string; finalizadaEm: string }[] = [];
   falha?: Error;
-  async diagnosticoConcluido(evento: DiagnosticoConcluido) {
+  montarDiagnosticoConcluido(evento: DiagnosticoConcluido): CallbackPendente {
+    return {
+      id: randomUUID(),
+      type: 'execucao.diagnostico-concluido',
+      data: structuredClone(evento),
+    };
+  }
+  async enviar(envelope: CallbackPendente) {
     if (this.falha) throw this.falha;
-    this.diagnosticos.push(evento);
+    this.envelopesEnviados.push(envelope.id);
+    this.diagnosticos.push(envelope.data as DiagnosticoConcluido);
   }
   async execucaoFinalizada(evento: { numeroOS: string; finalizadaEm: string }) {
     if (this.falha) throw this.falha;

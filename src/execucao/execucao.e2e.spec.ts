@@ -228,7 +228,7 @@ describe('Execucao (e2e: DynamoDB Local + mock do OS Service)', () => {
     const res = await api()
       .post('/execucao/ordens/OS-200/diagnostico')
       .set('Authorization', mecanico)
-      .send({ diagnostico: 'x' })
+      .send({ diagnostico: 'Oleo vencido' })
       .expect(409);
     expect(res.body.motivo).toContain('Estoque insuficiente');
     expect(await saldo(c.p1)).toBe(5);
@@ -242,7 +242,7 @@ describe('Execucao (e2e: DynamoDB Local + mock do OS Service)', () => {
     await api()
       .post('/execucao/ordens/OS-300/diagnostico')
       .set('Authorization', mecanico)
-      .send({ diagnostico: 'x' })
+      .send({ diagnostico: 'Oleo vencido' })
       .expect(200);
     expect(await saldo(c.p1)).toBe(0);
     const r = await api()
@@ -271,34 +271,71 @@ describe('Execucao (e2e: DynamoDB Local + mock do OS Service)', () => {
     expect(recusa.body.motivo).toContain('CANCELADA');
   });
 
-  it('OS Service fora do ar: 502 e a baixa e devolvida; recusa do OS (404) = 409; 409 do OS repete', async () => {
+  it('OS Service fora do ar: 502 mantem a baixa; repetir reenvia o MESMO envelope; recusa do OS (404) = 409 e devolve; 409 do OS repete', async () => {
     const c = await diagnostico('OS-400', 1, 1);
-    os.responder({ status: 503 });
-    await api()
+    os.responder({ status: 503 }, { status: 503 }, { status: 503 }, { status: 503 });
+    const fora = await api()
       .post('/execucao/ordens/OS-400/diagnostico')
       .set('Authorization', mecanico)
-      .send({ diagnostico: 'x' })
+      .send({ diagnostico: 'Oleo vencido' })
       .expect(502);
-    expect(await saldo(c.p1)).toBe(5);
+    expect(fora.body.message).toContain('repita POST');
+    // resultado ambiguo: o OS pode ter gerado o orcamento, entao nada e devolvido
+    expect(await saldo(c.p1)).toBe(3);
+    const idOriginal = (os.recebidas[0].body as { id: string }).id;
+
+    os.limpar();
     os.responder({ status: 404, body: { motivo: 'OS nao encontrada' } });
     const res = await api()
       .post('/execucao/ordens/OS-400/diagnostico')
       .set('Authorization', mecanico)
-      .send({ diagnostico: 'x' })
+      .send({ diagnostico: 'Oleo vencido' })
       .expect(409);
+    expect((os.recebidas[0].body as { id: string }).id).toBe(idOriginal);
     expect(res.body.motivo).toContain('OS nao encontrada');
     expect(await saldo(c.p1)).toBe(5);
+    const reaberta = await api().get('/execucao/ordens/OS-400').set('Authorization', mecanico);
+    expect(reaberta.body.status).toBe('EM_DIAGNOSTICO');
+
     // 409 do OS = "repita o callback": o mesmo envelope e reenviado e a baixa fica
     os.limpar();
     os.responder({ status: 409, body: { motivo: 'saga alterada, repita' } }, { status: 200 });
     await api()
       .post('/execucao/ordens/OS-400/diagnostico')
       .set('Authorization', mecanico)
-      .send({ diagnostico: 'x' })
+      .send({ diagnostico: 'Oleo vencido' })
       .expect(200);
     expect(os.recebidas).toHaveLength(2);
     expect(os.recebidas[1].body).toEqual(os.recebidas[0].body);
     expect(await saldo(c.p1)).toBe(3);
+  });
+
+  it('DELETEs simultaneos do OS (transacao real no DynamoDB) devolvem uma unica vez', async () => {
+    const c = await diagnostico('OS-450', 2, 1);
+    await api()
+      .post('/execucao/ordens/OS-450/diagnostico')
+      .set('Authorization', mecanico)
+      .send({ diagnostico: 'Oleo vencido' })
+      .expect(200);
+    expect(await saldo(c.p1)).toBe(2);
+    const respostas = await Promise.all(
+      [1, 2, 3].map(() =>
+        api().delete('/execucao/ordens/OS-450').set('Authorization', osService).send({}),
+      ),
+    );
+    expect(respostas.map((r) => r.status)).toEqual([200, 200, 200]);
+    expect(await saldo(c.p1)).toBe(5);
+    const devolucoes = respostas.flatMap((r) => r.body.devolucoes as unknown[]);
+    expect(devolucoes).toHaveLength(2);
+  });
+
+  it('rotas do OS Service sao so SERVICO: ADMIN recebe 403', async () => {
+    await api()
+      .post('/execucao/ordens')
+      .set('Authorization', admin)
+      .send({ numeroOS: 'OS-ADM', veiculoId: 'v-adm' })
+      .expect(403);
+    await api().delete('/execucao/ordens/OS-ADM').set('Authorization', admin).expect(403);
   });
 
   it('CRUD de produtos com entrada de estoque auditada; SKU duplicado = 409', async () => {

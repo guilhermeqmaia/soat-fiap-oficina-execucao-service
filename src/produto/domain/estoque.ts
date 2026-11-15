@@ -11,8 +11,6 @@ export interface ItemDeBaixa {
   quantidade: number;
 }
 
-type GeradorDeId = () => string;
-
 /** Soma as quantidades por produto (o mesmo produto pode atender varios servicos). */
 export function consolidarPorProduto(
   movimentacoes: Pick<MovimentacaoEstoque, 'produtoId' | 'tipo' | 'quantidade'>[],
@@ -45,14 +43,35 @@ export function validarSaldo(itens: ItemDeBaixa[], produtos: Map<string, Produto
   if (emFalta.length) throw new EstoqueInsuficienteError(emFalta);
 }
 
-/** Uma movimentacao BAIXA por (produto, servico), para rastrear qual servico consumiu a peca. */
+/**
+ * Id deterministico de uma movimentacao ligada a um diagnostico: o mesmo
+ * (tipo, baixa, produto, servico) gera sempre o mesmo id. Com o
+ * `attribute_not_exists(movimentacaoId)` da transacao, repetir uma baixa ou uma
+ * devolucao (retry do OS, retry do SDK, chamadas concorrentes) nunca move o saldo
+ * duas vezes.
+ */
+export function idMovimentacao(
+  tipo: TipoMovimentacao.BAIXA | TipoMovimentacao.DEVOLUCAO,
+  baixaId: string,
+  produtoId: string,
+  servicoId: string | null,
+): string {
+  return `${tipo}#${baixaId}#${produtoId}#${servicoId ?? '-'}`;
+}
+
+/**
+ * Uma movimentacao BAIXA por (produto, servico), para rastrear qual servico
+ * consumiu a peca. `baixaId` identifica o fechamento do diagnostico (um por
+ * versao da execucao) e entra no id da movimentacao.
+ */
 export function planejarBaixa(
   osId: string,
+  baixaId: string,
   itens: ItemDeBaixa[],
-  gerarId: GeradorDeId,
   agora: Date = new Date(),
 ): MovimentacaoEstoque[] {
   exigirTexto(osId, 'osId');
+  exigirTexto(baixaId, 'baixaId');
   const agrupado = new Map<string, ItemDeBaixa>();
   for (const item of itens) {
     exigirQuantidade(item.quantidade, 'quantidade');
@@ -62,7 +81,7 @@ export function planejarBaixa(
   }
   const data = agora.toISOString();
   return [...agrupado.values()].map((item) => ({
-    movimentacaoId: gerarId(),
+    movimentacaoId: idMovimentacao(TipoMovimentacao.BAIXA, baixaId, item.produtoId, item.servicoId),
     produtoId: item.produtoId,
     tipo: TipoMovimentacao.BAIXA,
     quantidade: item.quantidade,
@@ -73,34 +92,26 @@ export function planejarBaixa(
 }
 
 /**
- * Devolucao (rollback) a partir do historico da OS: para cada (produto,
- * servico), devolve o liquido ainda baixado (BAIXA - DEVOLUCAO). Idempotente:
- * rodar de novo depois de uma devolucao completa nao gera movimentacoes.
+ * Devolucao (rollback) de uma baixa: uma DEVOLUCAO para cada BAIXA efetivamente
+ * gravada, com a mesma quantidade e id deterministico. Recebe as baixas lidas do
+ * banco (leitura consistente por id), nunca o indice por OS, que e eventual.
  */
 export function planejarDevolucao(
   osId: string,
-  historico: MovimentacaoEstoque[],
-  gerarId: GeradorDeId,
+  baixaId: string,
+  baixas: MovimentacaoEstoque[],
   agora: Date = new Date(),
 ): MovimentacaoEstoque[] {
-  const liquido = new Map<string, { produtoId: string; servicoId: string | null; qtd: number }>();
-  for (const m of historico) {
-    if (m.osId !== osId || m.tipo === TipoMovimentacao.ENTRADA) continue;
-    const chave = `${m.produtoId}|${m.servicoId ?? ''}`;
-    const atual = liquido.get(chave) ?? { produtoId: m.produtoId, servicoId: m.servicoId, qtd: 0 };
-    atual.qtd += m.tipo === TipoMovimentacao.BAIXA ? m.quantidade : -m.quantidade;
-    liquido.set(chave, atual);
-  }
   const data = agora.toISOString();
-  return [...liquido.values()]
-    .filter((l) => l.qtd > 0)
-    .map((l) => ({
-      movimentacaoId: gerarId(),
-      produtoId: l.produtoId,
+  return baixas
+    .filter((b) => b.osId === osId && b.tipo === TipoMovimentacao.BAIXA)
+    .map((b) => ({
+      movimentacaoId: idMovimentacao(TipoMovimentacao.DEVOLUCAO, baixaId, b.produtoId, b.servicoId),
+      produtoId: b.produtoId,
       tipo: TipoMovimentacao.DEVOLUCAO,
-      quantidade: l.qtd,
+      quantidade: b.quantidade,
       osId,
-      servicoId: l.servicoId,
+      servicoId: b.servicoId,
       data,
     }));
 }

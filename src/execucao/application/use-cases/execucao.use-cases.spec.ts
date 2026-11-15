@@ -18,6 +18,9 @@ import { ExecucaoNaoEncontradaError } from '../../domain/errors/execucao-nao-enc
 import { TransicaoDeStatusInvalidaError } from '../../domain/errors/transicao-invalida.error';
 import { ConflitoDeNegocioError } from '../../../shared/domain/erros-de-dominio';
 import { OsServiceIndisponivelError } from '../ports/os-service.gateway';
+import { OsServiceRecusouError } from '../../domain/errors/os-service-recusou.error';
+import { ExecucaoAlteradaConcorrentementeError } from '../../domain/errors/execucao-alterada-concorrentemente.error';
+import { comRetentativa } from '../com-retentativa';
 import { EnfileirarExecucaoUseCase } from './enfileirar-execucao.use-case';
 import { AtribuirMecanicoUseCase } from './atribuir-mecanico.use-case';
 import { VincularServicosUseCase } from './vincular-servicos.use-case';
@@ -235,7 +238,7 @@ describe('casos de uso de Execucao', () => {
 
     it('saldo insuficiente: nada baixa, nenhum callback e o status volta', async () => {
       await prepararDiagnostico(4, 2);
-      await expect(concluir.execute({ osId: 'OS-1', diagnostico: 'x' })).rejects.toThrow(
+      await expect(concluir.execute({ osId: 'OS-1', diagnostico: 'Oleo vencido' })).rejects.toThrow(
         EstoqueInsuficienteError,
       );
       expect(estoque.saldo('p1')).toBe(5);
@@ -249,17 +252,42 @@ describe('casos de uso de Execucao', () => {
       estoque.falharProximaAplicacao = new EstoqueInsuficienteError([
         { produtoId: 'p1', solicitado: 3, disponivel: null },
       ]);
-      await expect(concluir.execute({ osId: 'OS-1', diagnostico: 'x' })).rejects.toThrow(
+      await expect(concluir.execute({ osId: 'OS-1', diagnostico: 'Oleo vencido' })).rejects.toThrow(
         EstoqueInsuficienteError,
       );
       expect(repo.itens.get('OS-1')?.status).toBe(S.EM_DIAGNOSTICO);
     });
 
-    it('OS Service fora: devolve as pecas e restaura o status', async () => {
+    it('OS Service fora (ambiguo): mantem baixa e diagnostico; repetir reenvia o MESMO envelope', async () => {
       await prepararDiagnostico();
       os.falha = new OsServiceIndisponivelError('fora');
-      await expect(concluir.execute({ osId: 'OS-1', diagnostico: 'x' })).rejects.toThrow(
-        OsServiceIndisponivelError,
+      await expect(concluir.execute({ osId: 'OS-1', diagnostico: 'Oleo vencido' })).rejects.toThrow(
+        /repita POST/,
+      );
+      // nada devolvido: o OS pode ter gerado o orcamento
+      expect([estoque.saldo('p1'), estoque.saldo('p2')]).toEqual([2, 0]);
+      const pendente = repo.itens.get('OS-1')!.callbackPendente!;
+      expect(repo.itens.get('OS-1')).toMatchObject({
+        status: S.AGUARDANDO_APROVACAO,
+        estoqueBaixado: true,
+      });
+
+      os.falha = undefined;
+      const e = await concluir.execute({ osId: 'OS-1', diagnostico: 'ignorado no reenvio' });
+      expect(os.envelopesEnviados).toEqual([pendente.id]);
+      expect(e.callbackPendente).toBeNull();
+      expect(e.diagnostico).toBe('Oleo vencido');
+      expect(estoque.movimentacoes.filter((m) => m.tipo === TipoMovimentacao.BAIXA)).toHaveLength(
+        3,
+      );
+      expect([estoque.saldo('p1'), estoque.saldo('p2')]).toEqual([2, 0]);
+    });
+
+    it('OS recusa o diagnostico (4xx): devolve as pecas e reabre o diagnostico', async () => {
+      await prepararDiagnostico();
+      os.falha = new OsServiceRecusouError(400, 'Diagnostico invalido');
+      await expect(concluir.execute({ osId: 'OS-1', diagnostico: 'Oleo vencido' })).rejects.toThrow(
+        OsServiceRecusouError,
       );
       expect([estoque.saldo('p1'), estoque.saldo('p2')]).toEqual([5, 1]);
       expect(
@@ -269,13 +297,48 @@ describe('casos de uso de Execucao', () => {
         status: S.EM_DIAGNOSTICO,
         estoqueBaixado: false,
         diagnostico: null,
+        callbackPendente: null,
       });
+      // o mecanico corrige e conclui de novo: baixa nova (outro baixaId)
+      os.falha = undefined;
+      await concluir.execute({ osId: 'OS-1', diagnostico: 'Oleo vencido de novo' });
+      expect([estoque.saldo('p1'), estoque.saldo('p2')]).toEqual([2, 0]);
+    });
+
+    it('erro de infra na baixa: mantem baixaId e pendente; repetir conclui sem baixar em dobro', async () => {
+      await prepararDiagnostico();
+      estoque.falharProximaAplicacao = new Error('DynamoDB timeout');
+      await expect(concluir.execute({ osId: 'OS-1', diagnostico: 'Oleo vencido' })).rejects.toThrow(
+        'DynamoDB timeout',
+      );
+      expect(repo.itens.get('OS-1')).toMatchObject({ status: S.AGUARDANDO_APROVACAO });
+      expect(repo.itens.get('OS-1')!.callbackPendente).not.toBeNull();
+      const e = await concluir.execute({ osId: 'OS-1', diagnostico: 'Oleo vencido' });
+      expect(e.callbackPendente).toBeNull();
+      expect([estoque.saldo('p1'), estoque.saldo('p2')]).toEqual([2, 0]);
+      expect(os.envelopesEnviados).toHaveLength(1);
+    });
+
+    it('reenvio apos queda entre gravar e baixar: baixa agora; se faltar peca, reabre', async () => {
+      await prepararDiagnostico();
+      os.falha = new OsServiceIndisponivelError('fora');
+      await concluir.execute({ osId: 'OS-1', diagnostico: 'Oleo vencido' }).catch(() => undefined);
+      // simula a queda: a baixa nunca foi gravada
+      estoque.movimentacoes.length = 0;
+      const p1 = estoque.produtos.get('p1')!;
+      estoque.produtos.set('p1', Produto.reconstituir({ ...p1.toJSON(), quantidadeEstoque: 0 }));
+      os.falha = undefined;
+      await expect(concluir.execute({ osId: 'OS-1', diagnostico: 'x' })).rejects.toThrow(
+        EstoqueInsuficienteError,
+      );
+      expect(repo.itens.get('OS-1')).toMatchObject({ status: S.EM_DIAGNOSTICO, baixaId: null });
+      expect(os.envelopesEnviados).toEqual([]);
     });
 
     it('nao conclui duas vezes (sem baixa em dobro)', async () => {
       await prepararDiagnostico();
-      await concluir.execute({ osId: 'OS-1', diagnostico: 'x' });
-      await expect(concluir.execute({ osId: 'OS-1', diagnostico: 'x' })).rejects.toThrow(
+      await concluir.execute({ osId: 'OS-1', diagnostico: 'Oleo vencido' });
+      await expect(concluir.execute({ osId: 'OS-1', diagnostico: 'Oleo vencido' })).rejects.toThrow(
         TransicaoDeStatusInvalidaError,
       );
       expect(estoque.saldo('p1')).toBe(2);
@@ -285,7 +348,7 @@ describe('casos de uso de Execucao', () => {
   describe('liberar (DELETE do OS Service = rollback)', () => {
     it('devolve tudo, marca CANCELADA e e idempotente', async () => {
       await prepararDiagnostico();
-      await concluir.execute({ osId: 'OS-1', diagnostico: 'x' });
+      await concluir.execute({ osId: 'OS-1', diagnostico: 'Oleo vencido' });
       const r1 = await liberar.execute({ osId: 'OS-1', motivo: 'reprovado' });
       expect(r1.execucao?.status).toBe(S.CANCELADA);
       expect(r1.devolucoes).toHaveLength(3);
@@ -299,20 +362,102 @@ describe('casos de uso de Execucao', () => {
       expect(await liberar.execute({ osId: 'OS-X' })).toEqual({ execucao: null, devolucoes: [] });
     });
 
-    it('recusa depois de iniciada a execucao', async () => {
+    it('aceita EM_EXECUCAO (iniciar cuja resposta se perdeu) e devolve; recusa EXECUTADA', async () => {
       await prepararDiagnostico();
-      await concluir.execute({ osId: 'OS-1', diagnostico: 'x' });
+      await concluir.execute({ osId: 'OS-1', diagnostico: 'Oleo vencido' });
       await iniciar.execute({ osId: 'OS-1' });
-      await expect(liberar.execute({ osId: 'OS-1' })).rejects.toThrow(
+      const r = await liberar.execute({ osId: 'OS-1' });
+      expect(r.execucao?.status).toBe(S.CANCELADA);
+      expect([estoque.saldo('p1'), estoque.saldo('p2')]).toEqual([5, 1]);
+
+      await enfileirar.execute({ numeroOS: 'OS-9', veiculoId: 'v9' });
+      await atribuir.execute({ osId: 'OS-9', mecanicoId: 'mec-1' });
+      await vincularServicos.execute({ osId: 'OS-9', servicoIds: ['s1'] });
+      await concluir.execute({ osId: 'OS-9', diagnostico: 'Oleo vencido' });
+      await iniciar.execute({ osId: 'OS-9' });
+      await finalizar.execute({ osId: 'OS-9' });
+      await expect(liberar.execute({ osId: 'OS-9' })).rejects.toThrow(
         TransicaoDeStatusInvalidaError,
       );
+    });
+
+    it('DELETEs simultaneos devolvem uma unica vez', async () => {
+      await prepararDiagnostico();
+      await concluir.execute({ osId: 'OS-1', diagnostico: 'Oleo vencido' });
+      const rs = await Promise.all([
+        liberar.execute({ osId: 'OS-1' }),
+        liberar.execute({ osId: 'OS-1' }),
+        liberar.execute({ osId: 'OS-1' }),
+      ]);
+      expect([estoque.saldo('p1'), estoque.saldo('p2')]).toEqual([5, 1]);
+      expect(rs.flatMap((r) => r.devolucoes)).toHaveLength(3);
+      expect(rs.every((r) => r.execucao?.status === S.CANCELADA)).toBe(true);
+    });
+
+    it('queda entre devolver e gravar o cancelamento: a repeticao nao devolve de novo', async () => {
+      await prepararDiagnostico();
+      await concluir.execute({ osId: 'OS-1', diagnostico: 'Oleo vencido' });
+      const salvar = repo.salvar.bind(repo);
+      repo.salvar = jest.fn().mockRejectedValueOnce(new Error('pod caiu'));
+      await expect(liberar.execute({ osId: 'OS-1' })).rejects.toThrow('pod caiu');
+      repo.salvar = salvar;
+      expect(estoque.saldo('p1')).toBe(5);
+      const r = await liberar.execute({ osId: 'OS-1' });
+      expect(r.devolucoes).toEqual([]);
+      expect(r.execucao?.status).toBe(S.CANCELADA);
+      expect([estoque.saldo('p1'), estoque.saldo('p2')]).toEqual([5, 1]);
+    });
+
+    it('produto removido do catalogo depois da baixa: devolve os outros e nao trava', async () => {
+      await prepararDiagnostico();
+      await concluir.execute({ osId: 'OS-1', diagnostico: 'Oleo vencido' });
+      await estoque.remover('p2');
+      const r = await liberar.execute({ osId: 'OS-1' });
+      expect(r.execucao?.status).toBe(S.CANCELADA);
+      expect(r.devolucoes.map((d) => d.produtoId)).toEqual(['p1', 'p1']);
+      expect(estoque.saldo('p1')).toBe(5);
+    });
+  });
+
+  describe('concorrencia (lock otimista) nas rotas do OS Service', () => {
+    it('enfileirar simultaneo para a mesma OS cria uma execucao e responde igual', async () => {
+      const rs = await Promise.all([
+        enfileirar.execute({ numeroOS: 'OS-1', veiculoId: 'v1' }),
+        enfileirar.execute({ numeroOS: 'OS-1', veiculoId: 'v1' }),
+      ]);
+      expect(rs.map((r) => [r.execucao.osId, r.posicaoFila])).toEqual([
+        ['OS-1', 1],
+        ['OS-1', 1],
+      ]);
+      expect(repo.itens.size).toBe(1);
+    });
+
+    it('iniciar simultaneo e idempotente', async () => {
+      await prepararDiagnostico();
+      await concluir.execute({ osId: 'OS-1', diagnostico: 'Oleo vencido' });
+      const rs = await Promise.all([
+        iniciar.execute({ osId: 'OS-1' }),
+        iniciar.execute({ osId: 'OS-1' }),
+      ]);
+      expect(rs.map((e) => e.status)).toEqual([S.EM_EXECUCAO, S.EM_EXECUCAO]);
+    });
+
+    it('comRetentativa desiste depois de N conflitos e repassa outros erros na hora', async () => {
+      const conflito = jest.fn().mockRejectedValue(new ExecucaoAlteradaConcorrentementeError('OS'));
+      await expect(comRetentativa(conflito, 3)).rejects.toBeInstanceOf(
+        ExecucaoAlteradaConcorrentementeError,
+      );
+      expect(conflito).toHaveBeenCalledTimes(3);
+      const outro = jest.fn().mockRejectedValue(new Error('boom'));
+      await expect(comRetentativa(outro)).rejects.toThrow('boom');
+      expect(outro).toHaveBeenCalledTimes(1);
     });
   });
 
   describe('iniciar (OS Service) e finalizar (mecanico)', () => {
     it('fluxo ate EXECUTADA com callback execucao.finalizada', async () => {
       await prepararDiagnostico();
-      await concluir.execute({ osId: 'OS-1', diagnostico: 'x' });
+      await concluir.execute({ osId: 'OS-1', diagnostico: 'Oleo vencido' });
       expect((await iniciar.execute({ osId: 'OS-1' })).status).toBe(S.EM_EXECUCAO);
       expect((await iniciar.execute({ osId: 'OS-1' })).status).toBe(S.EM_EXECUCAO);
       const e = await finalizar.execute({ osId: 'OS-1', ator: mecanico('mec-1') });
@@ -329,7 +474,7 @@ describe('casos de uso de Execucao', () => {
 
     it('OS Service fora no finalizar: status revertido para EM_EXECUCAO', async () => {
       await prepararDiagnostico();
-      await concluir.execute({ osId: 'OS-1', diagnostico: 'x' });
+      await concluir.execute({ osId: 'OS-1', diagnostico: 'Oleo vencido' });
       await iniciar.execute({ osId: 'OS-1' });
       os.falha = new OsServiceIndisponivelError('fora');
       await expect(finalizar.execute({ osId: 'OS-1' })).rejects.toThrow(OsServiceIndisponivelError);

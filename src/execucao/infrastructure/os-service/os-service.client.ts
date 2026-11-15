@@ -11,6 +11,7 @@ import {
   OsServiceGateway,
   OsServiceIndisponivelError,
 } from '../../application/ports/os-service.gateway';
+import { CallbackPendente } from '../../domain/execucao.entity';
 
 export const PRODUCER = 'execucao-service';
 
@@ -43,21 +44,26 @@ export class OsServiceClient implements OsServiceGateway {
     this.baseUrl = (config.get<string>('OS_SERVICE_URL') ?? '').replace(/\/+$/, '');
   }
 
-  diagnosticoConcluido(evento: DiagnosticoConcluido): Promise<void> {
-    return this.enviar(evento.numeroOS, 'execucao.diagnostico-concluido', evento);
+  montarDiagnosticoConcluido(evento: DiagnosticoConcluido): CallbackPendente {
+    return this.montar('execucao.diagnostico-concluido', evento);
   }
 
   execucaoFinalizada(evento: { numeroOS: string; finalizadaEm: string }): Promise<void> {
-    return this.enviar(evento.numeroOS, 'execucao.finalizada', evento);
+    return this.enviar(this.montar('execucao.finalizada', evento));
   }
 
-  private async enviar(numeroOS: string, type: string, data: object): Promise<void> {
+  private montar(type: string, data: { numeroOS: string }): CallbackPendente {
+    return { ...criarEnvelopeHttp({ type, data, producer: PRODUCER }) };
+  }
+
+  async enviar(envelope: CallbackPendente): Promise<void> {
+    const { type } = envelope;
+    const numeroOS = (envelope.data as { numeroOS: string }).numeroOS;
     if (!this.baseUrl) {
       this.logger.warn(`OS_SERVICE_URL ausente: callback ${type} da OS ${numeroOS} ignorado (dev)`);
       return;
     }
     const url = `${this.baseUrl}/ordens-servico/${encodeURIComponent(numeroOS)}/eventos`;
-    const envelope = criarEnvelopeHttp({ type, data, producer: PRODUCER });
     for (let tentativa = 0; ; tentativa++) {
       try {
         await this.http.post(url, envelope, { correlationId: numeroOS });

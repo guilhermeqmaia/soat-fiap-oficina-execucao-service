@@ -15,6 +15,7 @@ import {
   ApiBadRequestResponse,
   ApiBearerAuth,
   ApiConflictResponse,
+  ApiServiceUnavailableResponse,
   ApiCreatedResponse,
   ApiForbiddenResponse,
   ApiNotFoundResponse,
@@ -35,6 +36,7 @@ import {
 } from './dto/execucao.dto';
 import { ExecucaoPresenter } from './presenters/execucao.presenter';
 import { ConflitoComMotivoFilter } from './conflito-com-motivo.filter';
+import { ConcorrenciaFilter } from './concorrencia.filter';
 import { OsServiceIndisponivelFilter } from './os-service/os-service-indisponivel.filter';
 import { EnfileirarExecucaoUseCase } from '../application/use-cases/enfileirar-execucao.use-case';
 import { AtribuirMecanicoUseCase } from '../application/use-cases/atribuir-mecanico.use-case';
@@ -58,7 +60,7 @@ import { ListarMovimentacoesUseCase } from '../../produto/application/use-cases/
 @ApiBearerAuth()
 @ApiUnauthorizedResponse({ description: 'Token JWT ausente ou invalido' })
 @ApiForbiddenResponse({ description: 'Role insuficiente ou execucao de outro mecanico' })
-@UseFilters(ConflitoComMotivoFilter, OsServiceIndisponivelFilter)
+@UseFilters(ConflitoComMotivoFilter, OsServiceIndisponivelFilter, ConcorrenciaFilter)
 @Controller('execucao/ordens')
 export class ExecucaoController {
   constructor(
@@ -77,7 +79,7 @@ export class ExecucaoController {
   ) {}
 
   @Post()
-  @Roles(Role.SERVICO, Role.ADMIN)
+  @Roles(Role.SERVICO)
   @ApiOperation({ summary: '`execucao.enfileirar` (OS Service): coloca a OS na fila' })
   @ApiCreatedResponse({ description: '{ numeroOS, posicaoFila } = execucao.enfileirada' })
   @ApiConflictResponse({ description: '{ motivo } = execucao.recusada (veiculo ja em execucao)' })
@@ -177,7 +179,10 @@ export class ExecucaoController {
   @ApiConflictResponse({
     description: '{ motivo }: estoque insuficiente, status invalido ou OS recusou',
   })
-  @ApiBadGatewayResponse({ description: 'OS Service indisponivel (baixa devolvida)' })
+  @ApiBadGatewayResponse({
+    description:
+      'OS Service nao confirmou (timeout/5xx): diagnostico e baixa mantidos; repita o POST para reenviar o mesmo callback',
+  })
   async diagnostico(
     @Param('numeroOS') osId: string,
     @Body() dto: ConcluirDiagnosticoDto,
@@ -189,7 +194,7 @@ export class ExecucaoController {
   }
 
   @Post(':numeroOS/iniciar')
-  @Roles(Role.SERVICO, Role.ADMIN)
+  @Roles(Role.SERVICO)
   @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: '`execucao.iniciar` (OS Service, orcamento aprovado): EM_EXECUCAO' })
   @ApiOkResponse({ description: '{ numeroOS } = execucao.iniciada (idempotente)' })
@@ -212,7 +217,7 @@ export class ExecucaoController {
   }
 
   @Delete(':numeroOS')
-  @Roles(Role.SERVICO, Role.ADMIN)
+  @Roles(Role.SERVICO)
   @HttpCode(HttpStatus.OK)
   @ApiOperation({
     summary:
@@ -221,7 +226,8 @@ export class ExecucaoController {
   @ApiOkResponse({
     description: '{ numeroOS, devolucoes } = execucao.reservas-liberadas (idempotente)',
   })
-  @ApiConflictResponse({ description: 'Execucao ja em execucao/executada' })
+  @ApiConflictResponse({ description: 'Execucao ja EXECUTADA (pecas usadas no conserto)' })
+  @ApiServiceUnavailableResponse({ description: 'Conflito de versao persistente: repita' })
   async liberarReservas(@Param('numeroOS') osId: string, @Body() dto: LiberarExecucaoDto) {
     const { execucao, devolucoes } = await this.liberar.execute({ osId, motivo: dto?.motivo });
     return { numeroOS: osId, status: execucao?.status ?? null, devolucoes };

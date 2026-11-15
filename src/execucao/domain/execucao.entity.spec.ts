@@ -153,7 +153,7 @@ describe('Execucao', () => {
 
   it('apos concluir, servicos/pecas/mecanico ficam bloqueados', () => {
     const e = comServicos();
-    e.concluirDiagnostico('ok');
+    e.concluirDiagnostico('Oleo vencido');
     expect(() => e.adicionarServico({ servicoId: 's3', nome: 'x', preco: 1 })).toThrow(
       ConflitoDeNegocioError,
     );
@@ -164,7 +164,7 @@ describe('Execucao', () => {
 
   it('fluxo feliz ate EXECUTADA; iniciar e idempotente', () => {
     const e = comServicos();
-    e.concluirDiagnostico('ok');
+    e.concluirDiagnostico('Oleo vencido');
     expect(e.iniciarExecucao()).toBe(true);
     expect(e.iniciarExecucao()).toBe(false);
     e.finalizar(new Date('2026-02-01T00:00:00Z'));
@@ -182,18 +182,68 @@ describe('Execucao', () => {
     const fila = naFila();
     expect(fila.cancelar()).toBe(true);
     const e = comServicos();
-    e.concluirDiagnostico('ok');
+    e.concluirDiagnostico('Oleo vencido');
     expect(e.cancelar()).toBe(true);
     expect(e.status).toBe(S.CANCELADA);
     expect(e.toJSON().estoqueBaixado).toBe(false);
     expect(e.cancelar()).toBe(false);
   });
 
-  it('nao cancela depois de iniciada a execucao', () => {
+  it('cancela em EM_EXECUCAO (iniciar cuja resposta se perdeu); nao cancela EXECUTADA', () => {
     const e = comServicos();
-    e.concluirDiagnostico('ok');
+    e.concluirDiagnostico('Oleo vencido');
     e.iniciarExecucao();
-    expect(() => e.cancelar()).toThrow(TransicaoDeStatusInvalidaError);
+    expect(e.cancelar()).toBe(true);
+    const f = comServicos();
+    f.concluirDiagnostico('Oleo vencido');
+    f.iniciarExecucao();
+    f.finalizar();
+    expect(() => f.exigirCancelavel()).toThrow(TransicaoDeStatusInvalidaError);
+    expect(() => f.cancelar()).toThrow(TransicaoDeStatusInvalidaError);
+  });
+
+  it('diagnostico: 5 a 1000 caracteres (mesma regra do OS) e baixaId por versao', () => {
+    expect(() => comServicos().concluirDiagnostico('curt')).toThrow(DadoInvalidoError);
+    expect(() => comServicos().concluirDiagnostico('a'.repeat(1001))).toThrow(DadoInvalidoError);
+    const e = comServicos();
+    e.concluirDiagnostico('Oleo vencido');
+    expect(e.baixaId).toBe(`${e.osId}@v${e.versao}`);
+    expect(e.estoqueBaixado).toBe(true);
+  });
+
+  it('callback pendente: registra, confirma; iniciar e cancelar limpam', () => {
+    const e = comServicos();
+    e.concluirDiagnostico('Oleo vencido');
+    expect(e.aguardandoConfirmacaoDoOs).toBe(false);
+    e.registrarCallbackPendente({ id: 'env-1', type: 'execucao.diagnostico-concluido' });
+    expect(e.aguardandoConfirmacaoDoOs).toBe(true);
+    expect(e.callbackPendente).toEqual({ id: 'env-1', type: 'execucao.diagnostico-concluido' });
+    e.confirmarCallback();
+    expect(e.callbackPendente).toBeNull();
+    e.registrarCallbackPendente({ id: 'env-2', type: 'x' });
+    e.iniciarExecucao();
+    expect(e.callbackPendente).toBeNull();
+  });
+
+  it('reabrir diagnostico (OS recusou): volta a EM_DIAGNOSTICO sem baixa, laudo nem pendente', () => {
+    const e = comServicos();
+    e.concluirDiagnostico('Oleo vencido');
+    e.registrarCallbackPendente({ id: 'env-1', type: 'x' });
+    e.reabrirDiagnostico();
+    expect(e.toJSON()).toMatchObject({
+      status: S.EM_DIAGNOSTICO,
+      diagnostico: null,
+      estoqueBaixado: false,
+      baixaId: null,
+      callbackPendente: null,
+    });
+  });
+
+  it('reconstituir aceita itens gravados antes de baixaId/callbackPendente', () => {
+    const { baixaId, callbackPendente, ...antigo } = comServicos().toJSON();
+    expect([baixaId, callbackPendente]).toEqual([null, null]);
+    const e = Execucao.reconstituir(antigo as never);
+    expect([e.baixaId, e.callbackPendente]).toEqual([null, null]);
   });
 
   it('reconstituir/toJSON nao compartilham referencias', () => {
