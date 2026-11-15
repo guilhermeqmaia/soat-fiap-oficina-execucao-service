@@ -27,6 +27,8 @@ jobs:
       - name: Integracao/e2e (DynamoDB Local via testcontainers)
         run: npm run test:integration
       - run: npm run build
+      - name: OpenAPI publicado em dia com o codigo (US-F4-15)
+        run: npm run openapi:export && git diff --exit-code openapi.yaml
       - uses: actions/upload-artifact@v4
         with: { name: coverage, path: coverage/unit/lcov.info, retention-days: 7 }
       - run: npm audit --omit=dev --audit-level=high
@@ -71,7 +73,7 @@ jobs:
       - run: npm ci && npm run test:all:cov
       - name: Analise
         if: ${{ env.SONAR_TOKEN != '' }}
-        uses: SonarSource/sonarqube-scan-action@v5
+        uses: SonarSource/sonarqube-scan-action@v6
         env: { SONAR_TOKEN: '${{ secrets.SONAR_TOKEN }}' }
       - name: Sem SONAR_TOKEN
         if: ${{ env.SONAR_TOKEN == '' }}

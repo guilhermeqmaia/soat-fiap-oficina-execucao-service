@@ -394,6 +394,24 @@ describe('casos de uso de Execucao', () => {
       expect(rs.every((r) => r.execucao?.status === S.CANCELADA)).toBe(true);
     });
 
+    it('perde o lock depois de devolver: a resposta ainda informa o que esta chamada devolveu', async () => {
+      await prepararDiagnostico();
+      await concluir.execute({ osId: 'OS-1', diagnostico: 'Oleo vencido' });
+      const salvar = repo.salvar.bind(repo);
+      // outra chamada grava o cancelamento entre a devolucao e o salvar desta
+      repo.salvar = jest.fn().mockImplementationOnce(async () => {
+        const outra = (await repo.buscarPorOsId('OS-1'))!;
+        outra.cancelar();
+        await salvar(outra);
+        throw new ExecucaoAlteradaConcorrentementeError('OS-1');
+      });
+      const r = await liberar.execute({ osId: 'OS-1' });
+      repo.salvar = salvar;
+      expect(r.execucao?.status).toBe(S.CANCELADA);
+      expect(r.devolucoes).toHaveLength(3);
+      expect([estoque.saldo('p1'), estoque.saldo('p2')]).toEqual([5, 1]);
+    });
+
     it('queda entre devolver e gravar o cancelamento: a repeticao nao devolve de novo', async () => {
       await prepararDiagnostico();
       await concluir.execute({ osId: 'OS-1', diagnostico: 'Oleo vencido' });

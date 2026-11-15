@@ -1,6 +1,6 @@
 # oficina-execucao-service
 
-[![CI](https://github.com/guilhermeqmaia/soat-fiap-oficina-execucao-service/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/guilhermeqmaia/soat-fiap-oficina-execucao-service/actions/workflows/ci.yml)
+[![CI](https://github.com/guilhermeqmaia/soat-fiap-oficina-execucao-service/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/guilhermeqmaia/soat-fiap-oficina-execucao-service/actions/workflows/ci.yml) [![CD](https://github.com/guilhermeqmaia/soat-fiap-oficina-execucao-service/actions/workflows/cd-aws.yml/badge.svg?branch=main)](https://github.com/guilhermeqmaia/soat-fiap-oficina-execucao-service/actions/workflows/cd-aws.yml) [![Coverage](https://sonarcloud.io/api/project_badges/measure?project=guilhermeqmaia_soat-fiap-oficina-execucao-service&metric=coverage)](https://sonarcloud.io/summary/overall?id=guilhermeqmaia_soat-fiap-oficina-execucao-service) [![Quality Gate](https://sonarcloud.io/api/project_badges/measure?project=guilhermeqmaia_soat-fiap-oficina-execucao-service&metric=alert_status)](https://sonarcloud.io/summary/overall?id=guilhermeqmaia_soat-fiap-oficina-execucao-service)
 
 Microsserviço **Execução** da Oficina Mecânica (Tech Challenge FIAP, Fase 4). Cuida da **execução das Ordens de Serviço (OS)**: atribuição de mecânico, diagnóstico (serviços + peças), catálogo de serviços e produtos, **estoque com baixa e devolução (rollback) transacionais** e o ciclo de vida da execução. A OS em si (dados e status oficial) pertence ao **OS Service** (`fase-04-soat-fiap-oficina-os-service`), acessado por HTTP.
 
@@ -242,7 +242,7 @@ npm run test:bdd           # BDD: cenarios Gherkin (features/) com Cucumber
 ```
 
 - **Unitários:** máquina de estados, agregado `Execucao`, validação de saldo, planejamento de baixa/devolução (idempotência), casos de uso com fakes (compensações quando o callback falha, idempotência, fila), `OsServiceClient` contra um servidor HTTP fake (envelope, JWT, correlação, retry em 5xx e em 409, 400/404), filtro `409 { motivo }`.
-- **e2e** (`*.e2e.spec.ts`): sobe `amazon/dynamodb-local` via testcontainers (ou usa `DYNAMODB_ENDPOINT` se definido, ex. `docker compose up -d dynamodb`), cria as tabelas com prefixo próprio e cobre: fluxo completo do contrato (enfileirar → diagnóstico → iniciar → finalizar, com os callbacks verificados), veículo duplicado, estoque insuficiente (nada baixado), `DELETE` idempotente, OS Service fora do ar (502 + devolução), roles por rota, CRUDs.
+- **e2e** (`*.e2e.spec.ts`): sobe `amazon/dynamodb-local` via testcontainers (ou usa `DYNAMODB_ENDPOINT` se definido, ex. `docker compose up -d dynamodb`), cria as tabelas com prefixo próprio e cobre: fluxo completo do contrato (enfileirar → diagnóstico → iniciar → finalizar, com os callbacks verificados), veículo duplicado, estoque insuficiente (nada baixado), `DELETE` idempotente, OS Service fora do ar (502 com baixa mantida; repetir reenvia o mesmo envelope), recusa do OS (devolução + diagnóstico reaberto), `DELETE`s simultâneos devolvendo uma única vez, rotas internas só para `SERVICO`, CRUDs.
 
 ### BDD (Gherkin + Cucumber)
 
@@ -265,6 +265,25 @@ Relatórios em `reports/cucumber.html` e `reports/cucumber.json` (fora do git); 
 | `features/cancelamento.feature` | Orçamento reprovado / OS cancelada: `DELETE` devolve as peças uma única vez (repetir não devolve de novo); cancelamento em cada status; cancelada não inicia; executada não devolve; OS desconhecida                                                                   |
 
 Estrutura: `features/*.feature` (cenários), `features/steps/` (steps finos: `execucao.steps.ts` e `os-service.steps.ts`) e `features/support/` (`ambiente.ts` sobe DynamoDB Local + OS Service fake + Nest uma vez por execução; `world.ts` guarda o estado do cenário e as operações de domínio pela API; `polling.ts`; `tokens.ts`). Cada cenário cria a sua OS, o seu veículo e o seu catálogo, então os cenários não dependem uns dos outros. A pasta `features/` fica fora do `src/`, então não entra nos configs do Jest nem na cobertura do Sonar.
+
+### Evidência de cobertura
+
+[![Coverage](https://sonarcloud.io/api/project_badges/measure?project=guilhermeqmaia_soat-fiap-oficina-execucao-service&metric=coverage)](https://sonarcloud.io/summary/overall?id=guilhermeqmaia_soat-fiap-oficina-execucao-service) [![Quality Gate](https://sonarcloud.io/api/project_badges/measure?project=guilhermeqmaia_soat-fiap-oficina-execucao-service&metric=alert_status)](https://sonarcloud.io/summary/overall?id=guilhermeqmaia_soat-fiap-oficina-execucao-service)
+
+O SonarCloud recebe os dois relatórios (`coverage/unit/lcov.info` e `coverage/integration/lcov.info`); o job `SonarCloud (quality gate)` é check obrigatório na `main`.
+
+| Suíte                                  | Resultado (15/11/2026)                                          |
+| -------------------------------------- | --------------------------------------------------------------- |
+| Unitários (`test:unit:cov`)            | 119 testes, 99,43% de linhas (gate 80%)                         |
+| Integração (`test:integration`)        | 13 testes contra o DynamoDB Local                               |
+| BDD (`test:bdd`)                       | 21 cenários, 249 passos                                         |
+| SonarCloud (`main`, unit + integração) | 95,4% de cobertura, quality gate OK, 0 bugs, 0 vulnerabilidades |
+
+Plano de testes do fluxo: [`docs/qa-plans/QA_PLAN_FLUXO-1.md`](docs/qa-plans/QA_PLAN_FLUXO-1.md).
+
+### Swagger / OpenAPI
+
+Swagger em `http://localhost:3002/api/docs` fora de produção (em produção ele é desligado e o gateway não expõe a rota). O contrato versionado é o [`openapi.yaml`](openapi.yaml), gerado do código por `npm run openapi:export` (sem DynamoDB) e publicado no hub em [`docs/contratos/openapi/execucao-service.yaml`](https://github.com/guilhermeqmaia/soat-fiap-oficina-os-service/blob/main/docs/contratos/openapi/execucao-service.yaml).
 
 ## Deploy
 
