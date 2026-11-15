@@ -31,6 +31,25 @@ jobs:
         with: { name: coverage, path: coverage/unit/lcov.info, retention-days: 7 }
       - run: npm audit --omit=dev --audit-level=high
 
+  bdd:
+    name: BDD (Gherkin + Cucumber)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '20', cache: npm }
+      - run: npm ci
+      # AppModule real + DynamoDB Local (testcontainers) + OS Service fake (US-F4-14)
+      - run: npm run test:bdd
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cucumber-report
+          path: |
+            reports/cucumber.html
+            reports/cucumber.json
+          retention-days: 14
+
   docker:
     name: Build da imagem
     runs-on: ubuntu-latest

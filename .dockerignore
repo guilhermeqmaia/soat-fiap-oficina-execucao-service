@@ -16,3 +16,8 @@ docker-compose.yml
 .idea
 **/*.spec.ts
 web
+# BDD (Cucumber): so roda no CI/local, fora da imagem
+features
+reports
+cucumber.js
+tsconfig.bdd.json

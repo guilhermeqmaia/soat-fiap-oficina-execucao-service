@@ -19,6 +19,11 @@ export class ServidorHttpFake {
     this.respostas.push(...respostas);
   }
 
+  /** Descarta as respostas programadas e mantem as requisicoes ja gravadas ("voltou ao ar"). */
+  limparRespostas(): void {
+    this.respostas = [];
+  }
+
   limpar(): void {
     this.recebidas.length = 0;
     this.respostas = [];
