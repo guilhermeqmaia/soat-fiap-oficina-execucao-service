@@ -238,10 +238,33 @@ curl -s "$API/execucao/ordens?status=EXECUTADA" -H "Authorization: Bearer $ADMIN
 ```bash
 npm run test:unit:cov      # domínio + casos de uso + OsServiceClient (gate 80%)
 npm run test:integration   # e2e: AppModule real + DynamoDB Local + OS Service fake (recebe os callbacks)
+npm run test:bdd           # BDD: cenarios Gherkin (features/) com Cucumber
 ```
 
 - **Unitários:** máquina de estados, agregado `Execucao`, validação de saldo, planejamento de baixa/devolução (idempotência), casos de uso com fakes (compensações quando o callback falha, idempotência, fila), `OsServiceClient` contra um servidor HTTP fake (envelope, JWT, correlação, retry em 5xx e em 409, 400/404), filtro `409 { motivo }`.
 - **e2e** (`*.e2e.spec.ts`): sobe `amazon/dynamodb-local` via testcontainers (ou usa `DYNAMODB_ENDPOINT` se definido, ex. `docker compose up -d dynamodb`), cria as tabelas com prefixo próprio e cobre: fluxo completo do contrato (enfileirar → diagnóstico → iniciar → finalizar, com os callbacks verificados), veículo duplicado, estoque insuficiente (nada baixado), `DELETE` idempotente, OS Service fora do ar (502 + devolução), roles por rota, CRUDs.
+
+### BDD (Gherkin + Cucumber)
+
+Cenários em português (`# language: pt`) do Fluxo 1 no nível do serviço (US-F4-14), executados pelo [Cucumber](https://github.com/cucumber/cucumber-js) contra o `AppModule` real, o DynamoDB Local (testcontainers, mesmo `src/test/dynamodb.container.ts` dos e2e) e um OS Service fake que recebe os callbacks (`src/test/servidor-http-fake.ts`). Todo estado é lido pela API (status da execução, saldo do produto, movimentações), com polling e timeout em vez de `sleep`.
+
+```bash
+npm run test:bdd                                   # todos os cenários (Docker rodando)
+npx cucumber-js features/diagnostico.feature       # um arquivo
+npx cucumber-js features/diagnostico.feature:41    # um cenário pela linha
+npx cucumber-js --dry-run                          # confere se todo step tem definição
+BDD_LOG=1 npm run test:bdd                         # com os logs do Nest/pino
+```
+
+Relatórios em `reports/cucumber.html` e `reports/cucumber.json` (fora do git); no CI, o job `BDD (Gherkin + Cucumber)` publica os dois no artifact `cucumber-report`. Um cenário que falha anexa ao relatório a OS, a última resposta HTTP e os callbacks recebidos. Variáveis: `BDD_TIMEOUT_MS` (padrão 10000) e `BDD_INTERVALO_MS` (100).
+
+| Arquivo                         | Cenários                                                                                                                                                                                                                                                               |
+| ------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `features/execucao.feature`     | Caminho feliz: enfileirar → assumir → vincular serviços e peças → diagnóstico (baixa + callback `execucao.diagnostico-concluido` com os itens) → `iniciar` → finalizar (callback `execucao.finalizada`, JWT de serviço e correlação); comandos repetidos do OS Service |
+| `features/diagnostico.feature`  | Estoque insuficiente (`409 { motivo }`, nada baixado, nenhum callback); OS Service fora do ar (500/503/504 → `502`, baixa mantida, repetir reenvia o **mesmo** envelope); OS Service recusa (400/404/422 → `409`, peças devolvidas, diagnóstico reaberto)              |
+| `features/cancelamento.feature` | Orçamento reprovado / OS cancelada: `DELETE` devolve as peças uma única vez (repetir não devolve de novo); cancelamento em cada status; cancelada não inicia; executada não devolve; OS desconhecida                                                                   |
+
+Estrutura: `features/*.feature` (cenários), `features/steps/` (steps finos: `execucao.steps.ts` e `os-service.steps.ts`) e `features/support/` (`ambiente.ts` sobe DynamoDB Local + OS Service fake + Nest uma vez por execução; `world.ts` guarda o estado do cenário e as operações de domínio pela API; `polling.ts`; `tokens.ts`). Cada cenário cria a sua OS, o seu veículo e o seu catálogo, então os cenários não dependem uns dos outros. A pasta `features/` fica fora do `src/`, então não entra nos configs do Jest nem na cobertura do Sonar.
 
 ## Deploy
 
